@@ -17,6 +17,27 @@ workflow here.
 | `node-service-tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App; optionally moves the floating `v<major>` tag | `version`, `ref`, `major-tag` (`false`)                                                                                                   |
 | `node-service-publish.yml`   | Pushes the image tested for the tagged commit to ECR and, for stable versions, Docker Hub                | none; reads `AWS_ACCOUNT_ID`, `AWS_REGION`, `ECR_REPOSITORY` from the caller's variables                                                   |
 
+`node-service-publish.yml` needs the caller's token to carry `actions: read` and `id-token: write`
+(plus `contents: read`); a reusable workflow can only reduce the caller's permissions, so the
+caller's `publish.yml` must grant them:
+
+```yaml
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    uses: DEFRA/lis-github-actions/.github/workflows/node-service-publish.yml@v0
+    secrets: inherit
+```
+
 The calling repository must contain `version.cake`, `base.cake`, `build.cake`, `.nvmrc` and a
 `Dockerfile`; the workflows check out the caller and run those scripts there. Secrets and
 variables (`LIS_SONAR_TOKEN`, `LIS_RELEASE_APP_CLIENT_ID`, `LIS_RELEASE_APP_PRIVATE_KEY`,
