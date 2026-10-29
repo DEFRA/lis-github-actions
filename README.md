@@ -16,7 +16,7 @@ of that language that ship a container image, and `npm-package-*` the npm packag
 | `version.yml`   | Calculates the SemVer version from the branch name and tags with `version.cake`; outputs `version`       | `ref`, `branch`, `release-type` (`prerelease` or `stable`)                                                                                |
 | `node-service-validate.yml`  | Runs the `Build` cake target, builds the production image, smoke tests `/health` and uploads the image   | `version`, `ref`, `smoke-port` (`3000`), `smoke-env` (one `KEY=VALUE` per line), `health-path` (`/health`), `dockerfile`, `image-target` |
 | `node-sonar.yml`     | Runs tests with coverage and SonarCloud; outputs `quality-gate-status`                                   | `version`, `ref`, `branch`, `test-command` (`npm run test:coverage`); secret `LIS_SONAR_TOKEN`                                            |
-| `tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App; optionally moves the floating `v<major>` tag | `version`, `ref`, `major-tag` (`false`)                                                                                                   |
+| `tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App                                               | `version`, `ref`                                                                                                                          |
 | `dotnet-service-validate.yml` | Runs an optional pre-build cake script, the `Build` cake target, builds the image with `PackOnly`, smoke tests and uploads it | `version`, `ref`, `pre-build-cake-script`, `pre-build-cake-target` (`Default`), `smoke-port` (`3000`), `smoke-env`, `smoke-postgres` (`false`), `health-path` |
 | `dotnet-sonar.yml`           | Builds, tests with OpenCover coverage and runs SonarCloud; outputs `quality-gate-status`                  | `version`, `ref`, `branch`, `sonar-exclusions`; secret `LIS_SONAR_TOKEN`                                                                  |
 | `npm-package-validate.yml`   | Runs the `Build` cake target for an npm package                                                          | `version`, `ref`                                                                                                                          |
@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   publish:
-    uses: DEFRA/lis-github-actions/.github/workflows/container-publish.yml@v0
+    uses: DEFRA/lis-github-actions/.github/workflows/container-publish.yml@0.1.0
     secrets: inherit
 ```
 
@@ -54,7 +54,7 @@ variables (`LIS_SONAR_TOKEN`, `LIS_RELEASE_APP_CLIENT_ID`, `LIS_RELEASE_APP_PRIV
 ```yaml
 jobs:
   get-version:
-    uses: DEFRA/lis-github-actions/.github/workflows/version.yml@v0
+    uses: DEFRA/lis-github-actions/.github/workflows/version.yml@0.1.0
     with:
       ref: ${{ github.event.pull_request.head.sha }}
       branch: ${{ github.event.pull_request.head.ref }}
@@ -62,7 +62,7 @@ jobs:
 
   validate:
     needs: get-version
-    uses: DEFRA/lis-github-actions/.github/workflows/node-service-validate.yml@v0
+    uses: DEFRA/lis-github-actions/.github/workflows/node-service-validate.yml@0.1.0
     with:
       version: ${{ needs.get-version.outputs.version }}
       ref: ${{ github.event.pull_request.head.sha }}
@@ -76,9 +76,11 @@ jobs:
 
 This repository releases itself with the same pipeline as the services: pushes to
 `feature/LREG-*` and `hotfix/LREG-*` branches tag `X.Y.Z-lreg-N.alpha.M` prereleases, merged pull
-requests tag the stable `X.Y.Z` and move the floating `v<major>` tag.
+requests tag the stable `X.Y.Z`.
 
-- Pin `@v<major>` to pick up fixes automatically.
+- Pin the exact stable version (`@0.1.0`), as the repositories do for their npm dependencies, so a
+  change here only reaches a pipeline through a reviewed bump; Dependabot's `github-actions`
+  ecosystem raises those bumps.
 - Pin a prerelease tag while testing a change to these workflows from a service branch.
 - `uses:` references cannot be expressions, so the ref is fixed per calling workflow.
 

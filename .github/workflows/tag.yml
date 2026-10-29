@@ -10,11 +10,6 @@ on:
         description: 'Exact ref or commit SHA to tag'
         required: true
         type: string
-      major-tag:
-        description: 'Also move the floating v<major> tag to this commit (stable versions only)'
-        required: false
-        type: boolean
-        default: false
     secrets:
       LIS_RELEASE_APP_PRIVATE_KEY:
         required: true
@@ -52,12 +47,3 @@ jobs:
 
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "refs/tags/$TAG"
-
-      - name: Move floating major tag
-        if: ${{ inputs.major-tag && !contains(inputs.version, '-') }}
-        env:
-          TAG: ${{ inputs.version }}
-        run: |
-          major_tag="v${TAG%%.*}"
-          git tag --force --annotate "$major_tag" -m "Release $TAG" "refs/tags/$TAG^{}"
-          git push --force origin "refs/tags/$major_tag"
