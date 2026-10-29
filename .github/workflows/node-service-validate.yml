@@ -1,0 +1,161 @@
+name: 'Validate'
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: 'Git ref or commit SHA to validate'
+        required: true
+        type: string
+      smoke-port:
+        description: 'Port the service listens on; passed as PORT and published for the health check'
+        required: false
+        type: string
+        default: '3000'
+      smoke-env:
+        description: 'Extra environment for the smoke test, one KEY=VALUE per line'
+        required: false
+        type: string
+        default: ''
+      health-path:
+        description: 'Path polled until it returns 2xx'
+        required: false
+        type: string
+        default: '/health'
+      dockerfile:
+        description: 'Dockerfile to build'
+        required: false
+        type: string
+        default: './Dockerfile'
+      image-target:
+        description: 'Dockerfile stage to build'
+        required: false
+        type: string
+        default: 'production'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 'Audit, Format, Lint, Build and Test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Validate
+        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        with:
+          cake-version: 6.3.0
+          script-path: ./build.cake
+          target: Build
+
+  build-image:
+    name: 'Build and Test Container Image'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare image metadata
+        id: image
+        env:
+          IMAGE_NAME: ${{ github.event.repository.name }}
+          REVISION: ${{ inputs.ref }}
+        run: |
+          echo "ref=$IMAGE_NAME:build-$REVISION" >> "$GITHUB_OUTPUT"
+          echo "artifact=container-image-$REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Build production image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          no-cache: true
+          provenance: false
+          sbom: false
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.image-target }}
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.ref }}
+          labels: |
+            defra.cdp.git.repo.url=${{ github.server_url }}/${{ github.repository }}
+            defra.cdp.git.repo.name=${{ github.repository }}
+            defra.cdp.service.name=${{ github.event.repository.name }}
+            defra.cdp.build.run_id=${{ github.run_id }}
+            defra.cdp.run_mode=service
+            git.hash=${{ inputs.ref }}
+            org.opencontainers.image.version=${{ inputs.version }}
+
+      - name: Smoke test production image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          PORT: ${{ inputs.smoke-port }}
+          SMOKE_ENV: ${{ inputs.smoke-env }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+        run: |
+          env_args=()
+          while IFS= read -r line; do
+            [[ -n "$line" ]] && env_args+=(--env "$line")
+          done <<< "$SMOKE_ENV"
+
+          container=$(docker run --detach "${env_args[@]}" --env "PORT=$PORT" --publish "$PORT:$PORT" "$IMAGE")
+
+          # shellcheck disable=SC2317 # invoked by the EXIT trap
+          cleanup() {
+            docker logs "$container" || true
+            docker rm --force "$container" || true
+          }
+          trap cleanup EXIT
+
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error "http://localhost:$PORT$HEALTH_PATH" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo 'Container did not become healthy within 30 seconds.' >&2
+          exit 1
+
+      - name: Export tested image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          mkdir container-artifact
+          docker image inspect "$IMAGE" --format '{{.Id}}' > container-artifact/image-id.txt
+          printf '%s\n' "$IMAGE" > container-artifact/image-ref.txt
+          docker save --output container-artifact/image.tar "$IMAGE"
+
+      - name: Upload tested image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.image.outputs.artifact }}
+          path: container-artifact
+          if-no-files-found: error
+          compression-level: 0

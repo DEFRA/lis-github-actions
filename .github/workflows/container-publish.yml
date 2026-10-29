@@ -1,0 +1,265 @@
+name: 'Publish Container Image'
+
+on:
+  workflow_call:
+    inputs:
+      migrations-path:
+        description: 'Directory of database migrations to package to S3 alongside the image; empty to skip'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+env:
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID || secrets.LIS_AWS_ACCOUNT_ID }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-2' }}
+  IMAGE_NAME: ${{ vars.ECR_REPOSITORY || github.event.repository.name }}
+
+jobs:
+  validate-release:
+    name: 'Validate Tagged Commit'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      is-latest: ${{ steps.latest.outputs.is-latest }}
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch branch references
+        run: git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Validate tag and source branch
+        id: validate
+        env:
+          PACKAGE_VERSION: ${{ github.ref_name }}
+          TAGGED_COMMIT: ${{ github.sha }}
+        run: |
+          stable='^[0-9]+\.[0-9]+\.[0-9]+$'
+          prerelease='^[0-9]+\.[0-9]+\.[0-9]+-lreg-[0-9]+\.alpha\.[1-9][0-9]*$'
+
+          if [[ "$PACKAGE_VERSION" =~ $stable ]]; then
+            if ! git merge-base --is-ancestor "$TAGGED_COMMIT" origin/main; then
+              echo "Stable tag '$PACKAGE_VERSION' is not on main." >&2
+              exit 1
+            fi
+          elif [[ "$PACKAGE_VERSION" =~ $prerelease ]]; then
+            containing_branches=$(git branch --remotes --contains "$TAGGED_COMMIT")
+            if ! grep -Eq 'origin/(feature|hotfix)/' <<< "$containing_branches"; then
+              echo "Prerelease tag '$PACKAGE_VERSION' is not on a feature or hotfix branch." >&2
+              exit 1
+            fi
+          else
+            echo "Tag '$PACKAGE_VERSION' is not a supported image version." >&2
+            exit 1
+          fi
+
+          echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this is the newest stable version
+        id: latest
+        env:
+          PACKAGE_VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          newest=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+
+          if [[ "$PACKAGE_VERSION" == "$newest" ]]; then
+            echo "is-latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "'$PACKAGE_VERSION' is not the newest stable version ('$newest'); latest will not be moved."
+            echo "is-latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  package-database:
+    name: 'Package Database'
+    needs: validate-release
+    if: inputs.migrations-path != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch main branch
+        run: git fetch --force origin main:refs/remotes/origin/main
+
+      - name: Check for database changes
+        id: database-changes
+        env:
+          MIGRATIONS_PATH: ${{ inputs.migrations-path }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          # Stable releases always receive a versioned schema package. For a
+          # prerelease, publish only when the branch differs from main.
+          if [[ "$VERSION" != *-* ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet origin/main...HEAD -- "$MIGRATIONS_PATH"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No database migration changes to publish for '$VERSION'." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.database-changes.outputs.changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-${{ github.event.repository.name }}-build-role
+
+      - name: Verify AWS identity
+        if: steps.database-changes.outputs.changed == 'true'
+        run: aws sts get-caller-identity
+
+      - name: Upload the database migration to S3
+        if: steps.database-changes.outputs.changed == 'true'
+        env:
+          BUCKET: cdp-management-database-migrations
+          MIGRATIONS_PATH: ${{ inputs.migrations-path }}
+          SERVICE_NAME: ${{ github.event.repository.name }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          mkdir -p output
+          tar -czf output/migrations.tgz "$MIGRATIONS_PATH"
+
+          sha256=$(sha256sum output/migrations.tgz | awk '{print $1}')
+          changeset_files=$(find "$MIGRATIONS_PATH" -type f -printf '%P\n' | jq -R . | jq -s .)
+
+          jq -n \
+            --argjson files "$changeset_files" \
+            --arg version "$VERSION" \
+            --arg sha256 "$sha256" \
+            --arg date "$(date -Is)" \
+            --arg commit "$GITHUB_SHA" \
+            --arg path "$MIGRATIONS_PATH" \
+            --arg format "db-migration-metadata:1.0.0" \
+            '{format: $format, files: $files, version: $version, sha256: $sha256, date: $date, path: $path, commit: $commit}' \
+            > output/migrations.metadata.json
+
+          destination="s3://$BUCKET/$SERVICE_NAME/$VERSION"
+          aws s3 cp output/migrations.tgz "$destination/migrations.tgz"
+          aws s3 cp output/migrations.metadata.json "$destination/migrations.metadata.json"
+          echo "Published database schema migration version \`$VERSION\`." >> "$GITHUB_STEP_SUMMARY"
+
+  publish-image:
+    name: 'Publish Tested Container Image'
+    needs: [validate-release, package-database]
+    if: ${{ !cancelled() && needs.validate-release.result == 'success' && (needs.package-database.result == 'success' || needs.package-database.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate publication configuration
+        run: |
+          missing=()
+          [[ -n "$AWS_ACCOUNT_ID" ]] || missing+=(AWS_ACCOUNT_ID)
+          [[ -n "$AWS_REGION" ]] || missing+=(AWS_REGION)
+          [[ -n "$IMAGE_NAME" ]] || missing+=(ECR_REPOSITORY)
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Missing required GitHub variables: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Download image artifact for tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: container-image-${{ github.sha }}
+        run: |
+          artifact_id=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT_NAME&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')
+
+          if [[ -z "$artifact_id" ]]; then
+            echo "No unexpired '$ARTIFACT_NAME' artifact exists for this tagged commit." >&2
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > container-artifact.zip
+          unzip -q container-artifact.zip -d container-artifact
+
+      - name: Load and verify tested image
+        id: image
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          source_image=$(cat container-artifact/image-ref.txt)
+          expected_id=$(cat container-artifact/image-id.txt)
+          docker load --input container-artifact/image.tar
+          actual_id=$(docker image inspect "$source_image" --format '{{.Id}}')
+          revision=$(docker image inspect "$source_image" --format '{{index .Config.Labels "git.hash"}}')
+
+          if [[ "$actual_id" != "$expected_id" ]]; then
+            echo "Loaded image ID does not match the validated artifact." >&2
+            exit 1
+          fi
+
+          if [[ "$revision" != "$EXPECTED_REVISION" ]]; then
+            echo "Image revision '$revision' does not match tag commit '$EXPECTED_REVISION'." >&2
+            exit 1
+          fi
+
+          echo "source=$source_image" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-${{ env.IMAGE_NAME }}-build-role
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+
+      - name: Push image to Amazon ECR
+        env:
+          SOURCE_IMAGE: ${{ steps.image.outputs.source }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          registry="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          version_image="$registry/$IMAGE_NAME:$VERSION"
+          revision_image="$registry/$IMAGE_NAME:sha-$GITHUB_SHA"
+
+          docker tag "$SOURCE_IMAGE" "$version_image"
+          docker tag "$SOURCE_IMAGE" "$revision_image"
+          docker push "$version_image"
+          docker push "$revision_image"
+
+      - name: Log in to Docker Hub
+        if: ${{ !contains(needs.validate-release.outputs.version, '-') }}
+        uses: DEFRA/cdp-build-action/docker-login@main
+        with:
+          iam-role-name: github-${{ env.IMAGE_NAME }}-build-role
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Push image to Docker Hub
+        if: ${{ !contains(needs.validate-release.outputs.version, '-') }}
+        env:
+          SOURCE_IMAGE: ${{ steps.image.outputs.source }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+          IS_LATEST: ${{ needs.validate-release.outputs.is-latest }}
+        run: |
+          version_image="defradigital/$IMAGE_NAME:$VERSION"
+          docker tag "$SOURCE_IMAGE" "$version_image"
+          docker push "$version_image"
+
+          if [[ "$IS_LATEST" == "true" ]]; then
+            latest_image="defradigital/$IMAGE_NAME:latest"
+            docker tag "$SOURCE_IMAGE" "$latest_image"
+            docker push "$latest_image"
+          fi

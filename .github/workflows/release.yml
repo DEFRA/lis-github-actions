@@ -1,0 +1,40 @@
+name: 'Release'
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+concurrency:
+  group: main-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  get-version:
+    name: 'Calculate Stable Version'
+    if: github.event.pull_request.merged == true
+    uses: ./.github/workflows/version.yml
+    with:
+      ref: ${{ github.event.pull_request.merge_commit_sha }}
+      branch: ${{ github.event.pull_request.head.ref }}
+      release-type: stable
+
+  validate:
+    name: 'Validate Merged Commit'
+    needs: get-version
+    uses: ./.github/workflows/support-validate.yml
+    with:
+      ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+  create-tag:
+    name: 'Tag Main'
+    needs: [get-version, validate]
+    uses: ./.github/workflows/tag.yml
+    with:
+      version: ${{ needs.get-version.outputs.version }}
+      ref: ${{ github.event.pull_request.merge_commit_sha }}
+      major-tag: true
+    secrets: inherit

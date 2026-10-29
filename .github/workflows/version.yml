@@ -1,0 +1,55 @@
+name: 'Calculate Version'
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch name) to check out before calculating the version'
+        required: true
+        type: string
+      branch:
+        description: 'Feature or hotfix branch used to determine the release type'
+        required: true
+        type: string
+      release-type:
+        description: 'Whether to calculate a prerelease or stable version'
+        required: false
+        type: string
+        default: 'prerelease'
+    outputs:
+      version:
+        description: 'The calculated semantic version'
+        value: ${{ jobs.calculate-version.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  calculate-version:
+    name: 'Calculate Version'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calculate_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Calculate Version
+        id: calculate_version
+        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        with:
+          cake-version: 6.3.0
+          script-path: ./version.cake
+          target: GetVersion
+          arguments: |
+            branch: ${{ inputs.branch }}
+            release_type: ${{ inputs.release-type }}

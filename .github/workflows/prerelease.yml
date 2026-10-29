@@ -1,0 +1,38 @@
+name: 'Prerelease'
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+      - 'hotfix/**'
+
+concurrency:
+  group: prerelease-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  get-version:
+    name: 'Calculate Version'
+    uses: ./.github/workflows/version.yml
+    with:
+      ref: ${{ github.sha }}
+      branch: ${{ github.ref_name }}
+      release-type: prerelease
+
+  validate:
+    name: 'Validate'
+    uses: ./.github/workflows/support-validate.yml
+    with:
+      ref: ${{ github.sha }}
+
+  create-tag:
+    name: 'Tag Validated Commit'
+    needs: [get-version, validate]
+    uses: ./.github/workflows/tag.yml
+    with:
+      version: ${{ needs.get-version.outputs.version }}
+      ref: ${{ github.sha }}
+    secrets: inherit

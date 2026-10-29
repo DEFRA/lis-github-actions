@@ -1,0 +1,92 @@
+name: 'Test and Sonar'
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: 'Git ref to check out before analysis'
+        required: true
+        type: string
+      test-command:
+        description: 'Command that runs the tests and writes coverage/lcov.info'
+        required: false
+        type: string
+        default: 'npm run test:coverage'
+      branch:
+        description: 'Branch name for branch analysis; omit for pull request analysis'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      LIS_SONAR_TOKEN:
+        required: true
+    outputs:
+      quality-gate-status:
+        description: 'SonarCloud quality gate result (PASSED, WARN or FAILED)'
+        value: ${{ jobs.sonar-cloud.outputs.quality-gate-status }}
+
+permissions:
+  contents: read
+
+jobs:
+  sonar-cloud:
+    name: 'SonarCloud Analysis'
+    runs-on: ubuntu-latest
+    outputs:
+      quality-gate-status: ${{ steps.quality_gate.outputs.quality-gate-status }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: eval "$TEST_COMMAND"
+
+      - name: Verify LCOV coverage
+        run: |
+          if [[ ! -s coverage/lcov.info ]]; then
+            echo "coverage/lcov.info was not created or is empty." >&2
+            exit 1
+          fi
+
+          if ! grep -q '^SF:' coverage/lcov.info; then
+            echo "coverage/lcov.info contains no source records." >&2
+            exit 1
+          fi
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f #v8.2.1
+        with:
+          args: >-
+            -Dsonar.projectVersion=${{ inputs.version }}
+            ${{ inputs.branch != '' && format('-Dsonar.branch.name={0}', inputs.branch) || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.LIS_SONAR_TOKEN }}
+
+      - name: SonarCloud Quality Gate check
+        id: quality_gate
+        uses: SonarSource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b #v1.20
+        timeout-minutes: 5
+        with:
+          scanMetadataReportFile: .scannerwork/report-task.txt
+        env:
+          SONAR_TOKEN: ${{ secrets.LIS_SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io

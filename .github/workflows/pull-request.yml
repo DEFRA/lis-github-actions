@@ -1,0 +1,53 @@
+name: 'Pull Request Validation'
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  get-version:
+    name: 'Calculate Prospective Version'
+    uses: ./.github/workflows/version.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+      branch: ${{ github.event.pull_request.head.ref }}
+      release-type: prerelease
+
+  validate:
+    name: 'Validate'
+    uses: ./.github/workflows/support-validate.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+
+  required-checks:
+    name: 'Pull Request Validation'
+    needs: [get-version, validate]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded
+        env:
+          GET_VERSION_RESULT: ${{ needs.get-version.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+        run: |
+          results=(
+            "get-version=$GET_VERSION_RESULT"
+            "validate=$VALIDATE_RESULT"
+          )
+
+          printf '%s\n' "${results[@]}"
+
+          for result in "${results[@]}"; do
+            if [[ "$result" != *=success ]]; then
+              echo "Required job did not succeed: $result" >&2
+              exit 1
+            fi
+          done
