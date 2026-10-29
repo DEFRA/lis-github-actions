@@ -1,8 +1,14 @@
+# Managed by lis-github-monitor from config/dependabot/workflows.yml in DEFRA/lis-github-monitor.
+# Edit the template there; changes here are overwritten.
 version: 2
+
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+      day: monday
+      time: '10:30'
+      timezone: Europe/London
     commit-message:
-      prefix: 'LREG-814:'
+      prefix: 'LREG-XXX:'
