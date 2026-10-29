@@ -2,19 +2,20 @@
 
 Shared, reusable GitHub Actions workflows for the Livestock Information Service (LIS) repositories.
 
-## Node.js service workflows
+## Workflows
 
-Five `workflow_call` workflows replace the per-repository `support-*.yml` copies in the Node.js
-service repositories (hubs, apps, fakes). A calling repository keeps thin `pull-request.yml`,
-`prerelease.yml`, `release.yml` and `publish.yml` trigger workflows and points each job at a
-workflow here.
+`workflow_call` workflows replace the per-repository `support-*.yml` copies. A calling repository
+keeps thin `pull-request.yml`, `prerelease.yml`, `release.yml` and `publish.yml` trigger workflows
+and points each job at a workflow here. Names say how widely a workflow applies: unprefixed
+workflows suit every LIS repository, `node-*` every Node.js repository, `node-service-*` the
+Node.js services (hubs, apps, fakes) that ship a container image.
 
 | Workflow                     | Purpose                                                                                                  | Inputs                                                                                                                                    |
 | ---------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `node-service-version.yml`   | Calculates the SemVer version from the branch name and tags with `version.cake`; outputs `version`       | `ref`, `branch`, `release-type` (`prerelease` or `stable`)                                                                                |
+| `version.yml`   | Calculates the SemVer version from the branch name and tags with `version.cake`; outputs `version`       | `ref`, `branch`, `release-type` (`prerelease` or `stable`)                                                                                |
 | `node-service-validate.yml`  | Runs the `Build` cake target, builds the production image, smoke tests `/health` and uploads the image   | `version`, `ref`, `smoke-port` (`3000`), `smoke-env` (one `KEY=VALUE` per line), `health-path` (`/health`), `dockerfile`, `image-target` |
-| `node-service-sonar.yml`     | Runs tests with coverage and SonarCloud; outputs `quality-gate-status`                                   | `version`, `ref`, `branch`, `test-command` (`npm run test:coverage`); secret `LIS_SONAR_TOKEN`                                            |
-| `node-service-tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App; optionally moves the floating `v<major>` tag | `version`, `ref`, `major-tag` (`false`)                                                                                                   |
+| `node-sonar.yml`     | Runs tests with coverage and SonarCloud; outputs `quality-gate-status`                                   | `version`, `ref`, `branch`, `test-command` (`npm run test:coverage`); secret `LIS_SONAR_TOKEN`                                            |
+| `tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App; optionally moves the floating `v<major>` tag | `version`, `ref`, `major-tag` (`false`)                                                                                                   |
 | `node-service-publish.yml`   | Pushes the image tested for the tagged commit to ECR and, for stable versions, Docker Hub                | none; reads `AWS_ACCOUNT_ID`, `AWS_REGION`, `ECR_REPOSITORY` from the caller's variables                                                   |
 
 `node-service-publish.yml` needs the caller's token to carry `actions: read` and `id-token: write`
@@ -48,7 +49,7 @@ variables (`LIS_SONAR_TOKEN`, `LIS_RELEASE_APP_CLIENT_ID`, `LIS_RELEASE_APP_PRIV
 ```yaml
 jobs:
   get-version:
-    uses: DEFRA/lis-github-actions/.github/workflows/node-service-version.yml@v0
+    uses: DEFRA/lis-github-actions/.github/workflows/version.yml@v0
     with:
       ref: ${{ github.event.pull_request.head.sha }}
       branch: ${{ github.event.pull_request.head.ref }}

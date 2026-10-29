@@ -15,7 +15,7 @@ permissions:
 jobs:
   get-version:
     name: 'Calculate Prospective Version'
-    uses: ./.github/workflows/node-service-version.yml
+    uses: ./.github/workflows/version.yml
     with:
       ref: ${{ github.event.pull_request.head.sha }}
       branch: ${{ github.event.pull_request.head.ref }}

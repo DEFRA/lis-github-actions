@@ -16,7 +16,7 @@ jobs:
   get-version:
     name: 'Calculate Stable Version'
     if: github.event.pull_request.merged == true
-    uses: ./.github/workflows/node-service-version.yml
+    uses: ./.github/workflows/version.yml
     with:
       ref: ${{ github.event.pull_request.merge_commit_sha }}
       branch: ${{ github.event.pull_request.head.ref }}
@@ -32,7 +32,7 @@ jobs:
   create-tag:
     name: 'Tag Main'
     needs: [get-version, validate]
-    uses: ./.github/workflows/node-service-tag.yml
+    uses: ./.github/workflows/tag.yml
     with:
       version: ${{ needs.get-version.outputs.version }}
       ref: ${{ github.event.pull_request.merge_commit_sha }}
