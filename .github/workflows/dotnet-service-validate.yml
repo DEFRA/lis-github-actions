@@ -61,7 +61,7 @@ jobs:
 
       - name: Validate pre-build script
         if: inputs.pre-build-cake-script != ''
-        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        uses: cake-build/cake-action@deebeed9c3cf71ad80a9dbdd0ac517392b8847ee # master after v3.0.1: runs on node24 (unreleased)
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
         with:
@@ -70,7 +70,7 @@ jobs:
           target: ${{ inputs.pre-build-cake-target }}
 
       - name: Validate App
-        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        uses: cake-build/cake-action@deebeed9c3cf71ad80a9dbdd0ac517392b8847ee # master after v3.0.1: runs on node24 (unreleased)
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
         with:
@@ -106,7 +106,7 @@ jobs:
           echo "artifact=container-image-$REVISION" >> "$GITHUB_OUTPUT"
 
       - name: Build production image with Cake
-        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        uses: cake-build/cake-action@deebeed9c3cf71ad80a9dbdd0ac517392b8847ee # master after v3.0.1: runs on node24 (unreleased)
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
           IMAGE_NAME: ${{ github.event.repository.name }}
