@@ -6,9 +6,10 @@ using System.Text.RegularExpressions;
 
 var hotfixBranchPattern = new Regex(@"^hotfix/(lreg-[0-9]+)-.+$");
 var featureBranchPattern = new Regex(@"^feature/(lreg-[0-9]+)-.+$");
+var dependabotBranchPattern = new Regex(@"^dependabot/.+$");
 var stableTagPattern = new Regex(@"^[0-9]+\.[0-9]+\.[0-9]+$");
 var versionPattern = new Regex(
-    @"^[0-9]+\.[0-9]+\.[0-9]+(?:-lreg-[0-9]+\.alpha\.[1-9][0-9]*)?$");
+    @"^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:lreg-[0-9]+|dependabot)\.alpha\.[1-9][0-9]*)?$");
 
 string ResolveRepositoryBranchName(string? branchName = null)
 {
@@ -54,6 +55,14 @@ string CalculateVersion(string? branchName = null, bool stable = false)
     if (hotfixMatch.Success)
     {
         storyId = hotfixMatch.Groups[1].Value;
+        bumpType = "patch";
+    }
+    else if (dependabotBranchPattern.IsMatch(resolvedBranchName))
+    {
+        // Dependabot branches are never tagged (prerelease.yml only runs for
+        // feature and hotfix branches) but their pull requests still need a
+        // prospective version for validation, and their merge is a patch.
+        storyId = "dependabot";
         bumpType = "patch";
     }
     else

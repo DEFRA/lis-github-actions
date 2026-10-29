@@ -84,6 +84,13 @@ requests tag the stable `X.Y.Z`.
 - Pin a prerelease tag while testing a change to these workflows from a service branch.
 - `uses:` references cannot be expressions, so the ref is fixed per calling workflow.
 
+## Dependabot
+
+`version.cake` accepts `dependabot/**` branches as a patch bump with the `dependabot` story id, so
+Dependabot pull requests pass validation; they are never tagged because the prerelease workflow
+only runs for `feature/**` and `hotfix/**` pushes. The `.github/dependabot.yml` in every LIS
+repository, this one included, is managed by `lis-github-monitor`.
+
 ## Validation
 
 Workflows are linted with [actionlint](https://github.com/rhysd/actionlint) on every pull
