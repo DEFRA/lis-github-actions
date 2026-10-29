@@ -36,5 +36,4 @@ jobs:
     with:
       version: ${{ needs.get-version.outputs.version }}
       ref: ${{ github.event.pull_request.merge_commit_sha }}
-      major-tag: true
     secrets: inherit
