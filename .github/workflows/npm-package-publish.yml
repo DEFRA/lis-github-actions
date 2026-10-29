@@ -1,0 +1,136 @@
+name: 'Publish npm Package'
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-release:
+    name: 'Validate Tagged Commit'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      dist-tag: ${{ steps.validate.outputs.dist-tag }}
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch branch references
+        run: git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Validate tag and source branch
+        id: validate
+        env:
+          PACKAGE_VERSION: ${{ github.ref_name }}
+          TAGGED_COMMIT: ${{ github.sha }}
+        run: |
+          stable='^[0-9]+\.[0-9]+\.[0-9]+$'
+          prerelease='^[0-9]+\.[0-9]+\.[0-9]+-lreg-[0-9]+\.alpha\.[1-9][0-9]*$'
+
+          if [[ "$PACKAGE_VERSION" =~ $stable ]]; then
+            if ! git merge-base --is-ancestor "$TAGGED_COMMIT" origin/main; then
+              echo "Stable tag '$PACKAGE_VERSION' is not on main." >&2
+              exit 1
+            fi
+            dist_tag='latest'
+          elif [[ "$PACKAGE_VERSION" =~ $prerelease ]]; then
+            containing_branches=$(git branch --remotes --contains "$TAGGED_COMMIT")
+            if ! grep -Eq 'origin/(feature|hotfix)/' <<< "$containing_branches"; then
+              echo "Prerelease tag '$PACKAGE_VERSION' is not on a feature or hotfix branch." >&2
+              exit 1
+            fi
+            dist_tag='alpha'
+          else
+            echo "Tag '$PACKAGE_VERSION' is not a supported package version." >&2
+            exit 1
+          fi
+
+          echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "dist-tag=$dist_tag" >> "$GITHUB_OUTPUT"
+
+  build-pack:
+    name: 'Pack Tagged Source'
+    needs: validate-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate-release.outputs.version }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Package tagged source
+        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        env:
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.version }}
+          OUTPUT_DIR: artifacts
+        with:
+          cake-version: 6.3.0
+          script-path: ./build.cake
+          target: PackOnly
+
+      - name: Verify package version
+        env:
+          EXPECTED_VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          mapfile -t packages < <(find artifacts -maxdepth 1 -type f -name '*.tgz')
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "Expected exactly one npm package, found ${#packages[@]}." >&2
+            exit 1
+          fi
+
+          packaged_version=$(tar -xOf "${packages[0]}" package/package.json | jq -r '.version')
+          if [[ "$packaged_version" != "$EXPECTED_VERSION" ]]; then
+            echo "Package version '$packaged_version' does not match tag '$EXPECTED_VERSION'." >&2
+            exit 1
+          fi
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: artifacts/*.tgz
+          if-no-files-found: error
+
+  publish-npm:
+    name: 'Publish to npmjs'
+    needs: [validate-release, build-pack]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download npm package
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-packages
+          path: artifacts
+
+      - name: Publish using npm trusted publishing
+        env:
+          DIST_TAG: ${{ needs.validate-release.outputs.dist-tag }}
+        run: npm publish ./artifacts/*.tgz --tag "$DIST_TAG"

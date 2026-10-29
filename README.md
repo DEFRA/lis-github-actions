@@ -9,7 +9,7 @@ keeps thin `pull-request.yml`, `prerelease.yml`, `release.yml` and `publish.yml`
 and points each job at a workflow here. Names say how widely a workflow applies: unprefixed
 workflows suit every LIS repository (or every service, for `container-publish`), `node-*` and
 `dotnet-*` every repository of that language, `node-service-*` and `dotnet-service-*` the services
-of that language that ship a container image.
+of that language that ship a container image, and `npm-package-*` the npm packages.
 
 | Workflow                     | Purpose                                                                                                  | Inputs                                                                                                                                    |
 | ---------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -19,6 +19,8 @@ of that language that ship a container image.
 | `tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App; optionally moves the floating `v<major>` tag | `version`, `ref`, `major-tag` (`false`)                                                                                                   |
 | `dotnet-service-validate.yml` | Runs an optional pre-build cake script, the `Build` cake target, builds the image with `PackOnly`, smoke tests and uploads it | `version`, `ref`, `pre-build-cake-script`, `pre-build-cake-target` (`Default`), `smoke-port` (`3000`), `smoke-env`, `smoke-postgres` (`false`), `health-path` |
 | `dotnet-sonar.yml`           | Builds, tests with OpenCover coverage and runs SonarCloud; outputs `quality-gate-status`                  | `version`, `ref`, `branch`, `sonar-exclusions`; secret `LIS_SONAR_TOKEN`                                                                  |
+| `npm-package-validate.yml`   | Runs the `Build` cake target for an npm package                                                          | `version`, `ref`                                                                                                                          |
+| `npm-package-publish.yml`    | Validates the tag, packs the tagged source with the `PackOnly` cake target, checks the packed version and publishes to npmjs with trusted publishing (`latest` for stable, `alpha` for prerelease) | none; the caller's `publish.yml` must grant `id-token: write` |
 | `container-publish.yml`      | Pushes the image tested for the tagged commit to ECR and, for stable versions, Docker Hub; optionally packages database migrations to S3 | `migrations-path` (empty to skip); reads `AWS_ACCOUNT_ID` (variable, or `LIS_AWS_ACCOUNT_ID` secret), `AWS_REGION`, `ECR_REPOSITORY` from the caller |
 
 `container-publish.yml` needs the caller's token to carry `actions: read` and `id-token: write`
