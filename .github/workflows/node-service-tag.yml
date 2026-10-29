@@ -1,0 +1,60 @@
+name: 'Create Git Tag'
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: 'Exact ref or commit SHA to tag'
+        required: true
+        type: string
+      major-tag:
+        description: 'Also move the floating v<major> tag to this commit (stable versions only)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  create-tag:
+    name: 'Create Git Tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.LIS_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.LIS_RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Create and push tag
+        env:
+          TAG: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "refs/tags/$TAG"
+
+      - name: Move floating major tag
+        if: ${{ inputs.major-tag && !contains(inputs.version, '-') }}
+        env:
+          TAG: ${{ inputs.version }}
+        run: |
+          major_tag="v${TAG%%.*}"
+          git tag --force --annotate "$major_tag" -m "Release $TAG" "refs/tags/$TAG^{}"
+          git push --force origin "refs/tags/$major_tag"

@@ -1,0 +1,25 @@
+name: 'Validate'
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref or commit SHA to validate'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 'Lint Workflows'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Lint workflows with actionlint
+        run: docker run --rm --volume "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.7 -color
