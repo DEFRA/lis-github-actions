@@ -7,8 +7,9 @@ Shared, reusable GitHub Actions workflows for the Livestock Information Service 
 `workflow_call` workflows replace the per-repository `support-*.yml` copies. A calling repository
 keeps thin `pull-request.yml`, `prerelease.yml`, `release.yml` and `publish.yml` trigger workflows
 and points each job at a workflow here. Names say how widely a workflow applies: unprefixed
-workflows suit every LIS repository, `node-*` every Node.js repository, `node-service-*` the
-Node.js services (hubs, apps, fakes) that ship a container image.
+workflows suit every LIS repository (or every service, for `container-publish`), `node-*` and
+`dotnet-*` every repository of that language, `node-service-*` and `dotnet-service-*` the services
+of that language that ship a container image.
 
 | Workflow                     | Purpose                                                                                                  | Inputs                                                                                                                                    |
 | ---------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -16,9 +17,11 @@ Node.js services (hubs, apps, fakes) that ship a container image.
 | `node-service-validate.yml`  | Runs the `Build` cake target, builds the production image, smoke tests `/health` and uploads the image   | `version`, `ref`, `smoke-port` (`3000`), `smoke-env` (one `KEY=VALUE` per line), `health-path` (`/health`), `dockerfile`, `image-target` |
 | `node-sonar.yml`     | Runs tests with coverage and SonarCloud; outputs `quality-gate-status`                                   | `version`, `ref`, `branch`, `test-command` (`npm run test:coverage`); secret `LIS_SONAR_TOKEN`                                            |
 | `tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App; optionally moves the floating `v<major>` tag | `version`, `ref`, `major-tag` (`false`)                                                                                                   |
-| `node-service-publish.yml`   | Pushes the image tested for the tagged commit to ECR and, for stable versions, Docker Hub                | none; reads `AWS_ACCOUNT_ID`, `AWS_REGION`, `ECR_REPOSITORY` from the caller's variables                                                   |
+| `dotnet-service-validate.yml` | Runs an optional pre-build cake script, the `Build` cake target, builds the image with `PackOnly`, smoke tests and uploads it | `version`, `ref`, `pre-build-cake-script`, `pre-build-cake-target` (`Default`), `smoke-port` (`3000`), `smoke-env`, `smoke-postgres` (`false`), `health-path` |
+| `dotnet-sonar.yml`           | Builds, tests with OpenCover coverage and runs SonarCloud; outputs `quality-gate-status`                  | `version`, `ref`, `branch`, `sonar-exclusions`; secret `LIS_SONAR_TOKEN`                                                                  |
+| `container-publish.yml`      | Pushes the image tested for the tagged commit to ECR and, for stable versions, Docker Hub; optionally packages database migrations to S3 | `migrations-path` (empty to skip); reads `AWS_ACCOUNT_ID` (variable, or `LIS_AWS_ACCOUNT_ID` secret), `AWS_REGION`, `ECR_REPOSITORY` from the caller |
 
-`node-service-publish.yml` needs the caller's token to carry `actions: read` and `id-token: write`
+`container-publish.yml` needs the caller's token to carry `actions: read` and `id-token: write`
 (plus `contents: read`); a reusable workflow can only reduce the caller's permissions, so the
 caller's `publish.yml` must grant them:
 
@@ -35,12 +38,12 @@ permissions:
 
 jobs:
   publish:
-    uses: DEFRA/lis-github-actions/.github/workflows/node-service-publish.yml@v0
+    uses: DEFRA/lis-github-actions/.github/workflows/container-publish.yml@v0
     secrets: inherit
 ```
 
-The calling repository must contain `version.cake`, `base.cake`, `build.cake`, `.nvmrc` and a
-`Dockerfile`; the workflows check out the caller and run those scripts there. Secrets and
+The calling repository must contain `version.cake`, `base.cake` and `build.cake` (plus `.nvmrc` and a
+`Dockerfile` for Node.js services); the workflows check out the caller and run those scripts there. Secrets and
 variables (`LIS_SONAR_TOKEN`, `LIS_RELEASE_APP_CLIENT_ID`, `LIS_RELEASE_APP_PRIVATE_KEY`,
 `AWS_*`) resolve in the calling repository, so pass `secrets: inherit`.
 

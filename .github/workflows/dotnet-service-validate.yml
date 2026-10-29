@@ -1,0 +1,208 @@
+name: 'Validate'
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: 'Git ref or commit SHA to validate'
+        required: true
+        type: string
+      pre-build-cake-script:
+        description: 'Cake script to run before build.cake, for example ./liquibase.cake; empty to skip'
+        required: false
+        type: string
+        default: ''
+      pre-build-cake-target:
+        description: 'Target for the pre-build cake script'
+        required: false
+        type: string
+        default: 'Default'
+      smoke-port:
+        description: 'Port the service listens on inside the container (ASPNETCORE_URLS); published on 3101 for the health check'
+        required: false
+        type: string
+        default: '3000'
+      smoke-env:
+        description: 'Extra environment for the smoke test, one KEY=VALUE per line'
+        required: false
+        type: string
+        default: ''
+      smoke-postgres:
+        description: 'Start a PostgreSQL sidecar reachable as host "postgres" (database, user and password "smoke")'
+        required: false
+        type: boolean
+        default: false
+      health-path:
+        description: 'Path polled until it returns 2xx'
+        required: false
+        type: string
+        default: '/health'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 'Audit, Format, Lint, Build and Test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Validate pre-build script
+        if: inputs.pre-build-cake-script != ''
+        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        with:
+          cake-version: 6.3.0
+          script-path: ${{ inputs.pre-build-cake-script }}
+          target: ${{ inputs.pre-build-cake-target }}
+
+      - name: Validate App
+        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        with:
+          cake-version: 6.3.0
+          script-path: ./build.cake
+          target: Build
+
+  build-image:
+    name: 'Build and Test Container Image'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Prepare image metadata
+        id: image
+        env:
+          IMAGE_NAME: ${{ github.event.repository.name }}
+          REVISION: ${{ inputs.ref }}
+        run: |
+          echo "ref=$IMAGE_NAME:build-$REVISION" >> "$GITHUB_OUTPUT"
+          echo "artifact=container-image-$REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Build production image with Cake
+        uses: cake-build/cake-action@763b621ef69b317c1d6bde43a65f189c936b503b # master after v3.0.1: runs on node24 (unreleased)
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+          IMAGE_NAME: ${{ github.event.repository.name }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          REVISION: ${{ inputs.ref }}
+        with:
+          cake-version: 6.3.0
+          script-path: ./build.cake
+          target: PackOnly
+
+      - name: Smoke test production image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          PORT: ${{ inputs.smoke-port }}
+          SMOKE_ENV: ${{ inputs.smoke-env }}
+          SMOKE_POSTGRES: ${{ inputs.smoke-postgres }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+        run: |
+          network="$(uuidgen)"
+          database=''
+          container=''
+
+          # shellcheck disable=SC2317 # invoked by the EXIT trap
+          cleanup() {
+            if [[ -n "$container" ]]; then
+              docker logs "$container" || true
+              docker rm --force "$container" || true
+            fi
+            if [[ -n "$database" ]]; then
+              docker logs "$database" || true
+              docker rm --force "$database" || true
+            fi
+            docker network rm "$network" || true
+          }
+          trap cleanup EXIT
+
+          docker network create "$network"
+
+          if [[ "$SMOKE_POSTGRES" == 'true' ]]; then
+            database=$(docker run \
+              --detach \
+              --network "$network" \
+              --network-alias postgres \
+              --env POSTGRES_DB=smoke \
+              --env POSTGRES_USER=smoke \
+              --env POSTGRES_PASSWORD=smoke \
+              postgres:16-alpine)
+
+            for attempt in {1..30}; do
+              if docker exec "$database" pg_isready --username smoke --dbname smoke >/dev/null; then
+                break
+              fi
+              if [[ "$attempt" -eq 30 ]]; then
+                echo 'PostgreSQL did not become ready within 30 seconds.' >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          fi
+
+          env_args=()
+          while IFS= read -r line; do
+            [[ -n "$line" ]] && env_args+=(--env "$line")
+          done <<< "$SMOKE_ENV"
+
+          container=$(docker run \
+            --detach \
+            --network "$network" \
+            --env "ASPNETCORE_URLS=http://+:$PORT" \
+            "${env_args[@]}" \
+            --publish "3101:$PORT" \
+            "$IMAGE")
+
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error "http://localhost:3101$HEALTH_PATH" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo 'Container did not become healthy within 30 seconds.' >&2
+          exit 1
+
+      - name: Export tested image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          mkdir container-artifact
+          docker image inspect "$IMAGE" --format '{{.Id}}' > container-artifact/image-id.txt
+          printf '%s\n' "$IMAGE" > container-artifact/image-ref.txt
+          docker save --output container-artifact/image.tar "$IMAGE"
+
+      - name: Upload tested image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.image.outputs.artifact }}
+          path: container-artifact
+          if-no-files-found: error
+          compression-level: 0

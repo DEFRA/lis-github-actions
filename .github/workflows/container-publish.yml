@@ -2,6 +2,12 @@ name: 'Publish Container Image'
 
 on:
   workflow_call:
+    inputs:
+      migrations-path:
+        description: 'Directory of database migrations to package to S3 alongside the image; empty to skip'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   actions: read
@@ -9,7 +15,7 @@ permissions:
   id-token: write
 
 env:
-  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID || secrets.LIS_AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-2' }}
   IMAGE_NAME: ${{ vars.ECR_REPOSITORY || github.event.repository.name }}
 
@@ -73,9 +79,84 @@ jobs:
             echo "is-latest=false" >> "$GITHUB_OUTPUT"
           fi
 
+  package-database:
+    name: 'Package Database'
+    needs: validate-release
+    if: inputs.migrations-path != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch main branch
+        run: git fetch --force origin main:refs/remotes/origin/main
+
+      - name: Check for database changes
+        id: database-changes
+        env:
+          MIGRATIONS_PATH: ${{ inputs.migrations-path }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          # Stable releases always receive a versioned schema package. For a
+          # prerelease, publish only when the branch differs from main.
+          if [[ "$VERSION" != *-* ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet origin/main...HEAD -- "$MIGRATIONS_PATH"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No database migration changes to publish for '$VERSION'." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.database-changes.outputs.changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-${{ github.event.repository.name }}-build-role
+
+      - name: Verify AWS identity
+        if: steps.database-changes.outputs.changed == 'true'
+        run: aws sts get-caller-identity
+
+      - name: Upload the database migration to S3
+        if: steps.database-changes.outputs.changed == 'true'
+        env:
+          BUCKET: cdp-management-database-migrations
+          MIGRATIONS_PATH: ${{ inputs.migrations-path }}
+          SERVICE_NAME: ${{ github.event.repository.name }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          mkdir -p output
+          tar -czf output/migrations.tgz "$MIGRATIONS_PATH"
+
+          sha256=$(sha256sum output/migrations.tgz | awk '{print $1}')
+          changeset_files=$(find "$MIGRATIONS_PATH" -type f -printf '%P\n' | jq -R . | jq -s .)
+
+          jq -n \
+            --argjson files "$changeset_files" \
+            --arg version "$VERSION" \
+            --arg sha256 "$sha256" \
+            --arg date "$(date -Is)" \
+            --arg commit "$GITHUB_SHA" \
+            --arg path "$MIGRATIONS_PATH" \
+            --arg format "db-migration-metadata:1.0.0" \
+            '{format: $format, files: $files, version: $version, sha256: $sha256, date: $date, path: $path, commit: $commit}' \
+            > output/migrations.metadata.json
+
+          destination="s3://$BUCKET/$SERVICE_NAME/$VERSION"
+          aws s3 cp output/migrations.tgz "$destination/migrations.tgz"
+          aws s3 cp output/migrations.metadata.json "$destination/migrations.metadata.json"
+          echo "Published database schema migration version \`$VERSION\`." >> "$GITHUB_STEP_SUMMARY"
+
   publish-image:
     name: 'Publish Tested Container Image'
-    needs: validate-release
+    needs: [validate-release, package-database]
+    if: ${{ !cancelled() && needs.validate-release.result == 'success' && (needs.package-database.result == 'success' || needs.package-database.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Validate publication configuration
