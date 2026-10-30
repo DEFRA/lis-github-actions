@@ -104,9 +104,13 @@ jobs:
           context: .
           # Layer cache in the Actions cache: the dependency layer hits whenever
           # the lockfile is unchanged. pull keeps the pinned base image fresh.
+          # A release runs on pull_request closed, whose merge ref GitHub
+          # purges from the cache as the PR closes, so that run cannot read or
+          # reserve entries: skip the export there, and never fail a build on
+          # a cache write elsewhere.
           pull: true
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: ${{ github.event.action != 'closed' && 'type=gha,mode=max,ignore-error=true' || '' }}
           provenance: false
           sbom: false
           file: ${{ inputs.dockerfile }}
