@@ -43,6 +43,11 @@ jobs:
   validate:
     name: 'Audit, Format, Lint, Build and Test'
     runs-on: ubuntu-latest
+    # Cake runs npm with --cache ./.cake/npm-cache (base.cake), so point npm's
+    # own cache there too: setup-node caches `npm config get cache`, and would
+    # otherwise save and restore an empty ~/.npm.
+    env:
+      npm_config_cache: ${{ github.workspace }}/.cake/npm-cache
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
