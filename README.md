@@ -70,7 +70,20 @@ jobs:
       smoke-env: |
         HUB_JWT_SECRET=ci-smoke-test-hub-jwt-secret-0123456789
         SESSION_COOKIE_PASSWORD=ci-smoke-test-session-cookie-password-0123456789
+
+  sonar-analysis:
+    needs: get-version
+    uses: DEFRA/lis-github-actions/.github/workflows/node-sonar.yml@0.1.0
+    with:
+      version: ${{ needs.get-version.outputs.version }}
+      ref: ${{ github.event.pull_request.head.sha }}
+    secrets: inherit
 ```
+
+`sonar-analysis` needs only `get-version`: it installs and runs the tests itself, so it has
+nothing to wait for from `validate`, and running the two side by side takes the longer of them
+off the wall clock rather than the sum. Jobs that gate on both, such as the tag or the required
+checks, list both in `needs`.
 
 ## Versioning
 
