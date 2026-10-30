@@ -76,10 +76,12 @@ jobs:
 
   build-image:
     name: 'Build and Test Container Image'
-    needs: validate
+    # Runs alongside validate: the image build needs nothing validate produces,
+    # and callers gate the tag and publish on this whole workflow, so both jobs
+    # still have to pass.
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout validated source
+      - name: Checkout source
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
@@ -100,7 +102,11 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          no-cache: true
+          # Layer cache in the Actions cache: the dependency layer hits whenever
+          # the lockfile is unchanged. pull keeps the pinned base image fresh.
+          pull: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           provenance: false
           sbom: false
           file: ${{ inputs.dockerfile }}
