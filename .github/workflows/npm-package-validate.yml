@@ -41,7 +41,7 @@ jobs:
           cache: npm
 
       - name: Validate
-        uses: cake-build/cake-action@deebeed9c3cf71ad80a9dbdd0ac517392b8847ee # master after v3.0.1: runs on node24 (unreleased)
+        uses: cake-build/cake-action@ba3e4038094f93cd11603648f97d23d1ca7058b8 # master after v3.0.1: runs on node24 (unreleased)
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
         with:
