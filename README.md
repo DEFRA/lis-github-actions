@@ -101,8 +101,11 @@ requests tag the stable `X.Y.Z`.
 
 `version.cake` accepts `dependabot/**` branches as a patch bump with the `dependabot` story id, so
 Dependabot pull requests pass validation; they are never tagged because the prerelease workflow
-only runs for `feature/**` and `hotfix/**` pushes. The `.github/dependabot.yml` in every LIS
-repository, this one included, is managed by `lis-github-monitor`.
+only runs for `feature/**` and `hotfix/**` pushes. SonarCloud analysis is skipped on Dependabot
+pull requests because the Dependabot secrets store has no `LIS_SONAR_TOKEN`; merge them as a user
+rather than with `@dependabot merge`, so the release workflow runs with the real secrets and can
+tag and publish. The `.github/dependabot.yml` in every LIS repository, this one included, is
+managed by `lis-github-monitor`.
 
 ## Validation
 

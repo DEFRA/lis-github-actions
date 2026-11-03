@@ -25,7 +25,7 @@ on:
         required: true
     outputs:
       quality-gate-status:
-        description: 'SonarCloud quality gate result (PASSED, WARN or FAILED)'
+        description: 'SonarCloud quality gate result (PASSED, WARN or FAILED; empty when the actor is dependabot[bot])'
         value: ${{ jobs.sonar-cloud.outputs.quality-gate-status }}
 
 permissions:
@@ -84,6 +84,9 @@ jobs:
           fi
 
       - name: SonarCloud Scan
+        # Dependabot pull requests run with the Dependabot secrets store, so
+        # LIS_SONAR_TOKEN is unavailable; skip analysis rather than fail.
+        if: github.actor != 'dependabot[bot]'
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 #v8.3.0
         with:
           args: >-
@@ -95,6 +98,7 @@ jobs:
 
       - name: SonarCloud Quality Gate check
         id: quality_gate
+        if: github.actor != 'dependabot[bot]'
         uses: SonarSource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b #v1.20
         timeout-minutes: 5
         with:
