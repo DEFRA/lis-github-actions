@@ -22,7 +22,10 @@ on:
         default: '.github/**,tests/Endpoints/**'
     secrets:
       LIS_SONAR_TOKEN:
-        required: true
+        # Optional so Dependabot pull requests, whose secrets store has no
+        # LIS_SONAR_TOKEN, can call this workflow; the Sonar steps are skipped
+        # for that actor below.
+        required: false
     outputs:
       quality-gate-status:
         description: 'SonarCloud quality gate result (PASSED, WARN or FAILED; empty when the actor is dependabot[bot])'
