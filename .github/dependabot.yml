@@ -12,3 +12,8 @@ updates:
       timezone: Europe/London
     commit-message:
       prefix: 'LREG-XXX:'
+    groups:
+      # One pull request for every DEFRA/lis-github-actions workflow bump.
+      lis-github-actions:
+        patterns:
+          - DEFRA/lis-github-actions/*
