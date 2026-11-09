@@ -12,6 +12,11 @@ updates:
       timezone: Europe/London
     commit-message:
       prefix: 'LREG-XXX:'
+    cooldown:
+      default-days: 3
+      # Our own workflows are released and consumed the same day.
+      exclude:
+        - DEFRA/lis-github-actions/*
     groups:
       # One pull request for every DEFRA/lis-github-actions workflow bump.
       lis-github-actions:
