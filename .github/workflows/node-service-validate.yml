@@ -168,7 +168,7 @@ jobs:
           docker save --output container-artifact/image.tar "$IMAGE"
 
       - name: Upload tested image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.image.outputs.artifact }}
           path: container-artifact
