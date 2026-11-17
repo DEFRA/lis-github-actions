@@ -1,0 +1,319 @@
+name: 'Build and Test dotnet projects'
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: 'Git ref or commit SHA to validate'
+        required: true
+        type: string
+      smoke-port:
+        description: 'Port the service listens on inside the container (ASPNETCORE_URLS); published on 3101 for the health check'
+        required: false
+        type: string
+        default: '3000'
+      smoke-env:
+        description: 'Extra environment for the smoke test, one KEY=VALUE per line'
+        required: false
+        type: string
+        default: ''
+      smoke-postgres:
+        description: 'Start a PostgreSQL sidecar reachable as host "postgres" (database, user and password "smoke")'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect-features:
+    runs-on: ubuntu-latest
+    outputs:
+      has-dockerfile: ${{ steps.detect-docker.outputs.has-dockerfile }}
+      has-nuget: ${{ steps.detect-nuget.outputs.has-nuget }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Check for Dockerfile
+        id: detect-docker
+        run: |
+          if [[ -f Dockerfile ]]; then
+            echo "has-dockerfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-dockerfile=false" >> "$GITHUB_OUTPUT"
+          fi
+          
+      - name: Setup .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.0.1
+        with:
+          global-json-file: global.json
+
+      - name: Check for NuGet projects
+        id: detect-nuget
+        shell: bash
+        run: |
+          has_nuget=false
+          while IFS= read -r -d '' project; do
+            is_packable=$(dotnet msbuild "$project" \
+              -getProperty:IsPackable \
+              -p:Configuration=Release \
+              -nologo)
+            if [[ "${is_packable,,}" == 'true' ]]; then
+              echo "Packable project: $project"
+              has_nuget=true
+            fi
+          done < <(find . -type d \( -name .git -o -name bin -o -name obj \) -prune \
+            -o -type f -name '*.csproj' -print0)
+          echo "has-nuget=$has_nuget" >> "$GITHUB_OUTPUT"
+          
+  build-test-app:
+    name: 'Build and test source'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.0.1
+        with:
+          global-json-file: global.json
+
+      - name: Build solution
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: dotnet build --configuration Release -p:Version="$PACKAGE_VERSION"
+
+      - name: Run solution tests
+        run: dotnet test --configuration Release --no-build
+
+  build-test-docker:
+    name: 'Build and Test Container Image'
+    needs: [detect-features, build-test-app]
+    if: needs.detect-features.outputs.has-dockerfile == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Prepare image metadata
+        id: image
+        env:
+          IMAGE_NAME: ${{ github.event.repository.name }}
+          REVISION: ${{ inputs.ref }}
+        run: |
+          echo "ref=$IMAGE_NAME:build-$REVISION" >> "$GITHUB_OUTPUT"
+          echo "artifact=container-image-$REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Build docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: production
+          no-cache: true
+          provenance: false
+          sbom: false
+          load: true
+          tags: |
+            ${{ steps.image.outputs.ref }}
+          labels: |
+            defra.cdp.git.repo.url=https://github.com/${{ github.event.repository.name }}
+            defra.cdp.git.repo.name=${{ github.event.repository.name }}
+            defra.cdp.service.name=${{ github.event.repository.name }}
+            defra.cdp.build.run_id=${{ github.run_id }}
+            defra.cdp.run_mode=service
+            git.hash=${{ inputs.ref }}
+            org.opencontainers.image.version=${{ inputs.version }}
+
+      - name: Smoke test production image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          PORT: ${{ inputs.smoke-port }}
+          SMOKE_ENV: ${{ inputs.smoke-env }}
+          SMOKE_POSTGRES: ${{ inputs.smoke-postgres }}
+        run: |
+          network="$(uuidgen)"
+          database=''
+          container=''
+
+          # shellcheck disable=SC2317 # invoked by the EXIT trap
+          cleanup() {
+            if [[ -n "$container" ]]; then
+              docker logs "$container" || true
+              docker rm --force "$container" || true
+            fi
+            if [[ -n "$database" ]]; then
+              docker logs "$database" || true
+              docker rm --force "$database" || true
+            fi
+            docker network rm "$network" || true
+          }
+          trap cleanup EXIT
+
+          docker network create "$network"
+
+          if [[ "$SMOKE_POSTGRES" == 'true' ]]; then
+            database=$(docker run \
+              --detach \
+              --network "$network" \
+              --network-alias postgres \
+              --env POSTGRES_DB=smoke \
+              --env POSTGRES_USER=smoke \
+              --env POSTGRES_PASSWORD=smoke \
+              postgres:16-alpine)
+
+            for attempt in {1..30}; do
+              if docker exec "$database" pg_isready --username smoke --dbname smoke >/dev/null; then
+                break
+              fi
+              if [[ "$attempt" -eq 30 ]]; then
+                echo 'PostgreSQL did not become ready within 30 seconds.' >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          fi
+
+          env_args=()
+          while IFS= read -r line; do
+            [[ -n "$line" ]] && env_args+=(--env "$line")
+          done <<< "$SMOKE_ENV"
+
+          container=$(docker run \
+            --detach \
+            --network "$network" \
+            --env "ASPNETCORE_URLS=http://+:$PORT" \
+            "${env_args[@]}" \
+            --publish "3101:$PORT" \
+            "$IMAGE")
+
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error "http://localhost:3101/health" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo 'Container did not become healthy within 30 seconds.' >&2
+          exit 1
+
+      - name: Export tested image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          mkdir container-artifact
+          docker image inspect "$IMAGE" --format '{{.Id}}' > container-artifact/image-id.txt
+          printf '%s\n' "$IMAGE" > container-artifact/image-ref.txt
+          docker save --output container-artifact/image.tar "$IMAGE"
+
+      - name: Upload tested image artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.image.outputs.artifact }}
+          path: container-artifact
+          if-no-files-found: error
+          compression-level: 0
+          
+  
+  build-nuget:
+    name: 'Build, Test and Pack NuGet'
+    needs: [detect-features, build-test-app]
+    if: needs.detect-features.outputs.has-nuget == 'true'
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.0.1
+        with:
+          global-json-file: global.json
+
+      - name: Build solution
+        run: dotnet build --configuration Release -p:Version="$PACKAGE_VERSION"
+
+      - name: Run solution tests
+        run: dotnet test --configuration Release --no-build
+
+      - name: Pack NuGet packages
+        run: >-
+          dotnet pack --configuration Release --no-build
+          -p:Version="$PACKAGE_VERSION"
+          --output artifacts/nuget
+
+      - name: Record package provenance
+        run: |
+          packages=(artifacts/nuget/*.nupkg)
+          if [[ ! -f "${packages[0]}" ]]; then
+            echo 'No NuGet packages were produced.' >&2
+            exit 1
+          fi
+          jq -n \
+            --arg commit "$(git rev-parse HEAD)" \
+            --arg version "$PACKAGE_VERSION" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{commit: $commit, version: $version, run_id: $run_id, run_attempt: $run_attempt}' \
+            > artifacts/nuget/provenance.json
+
+      - name: Upload NuGet packages
+        id: upload-nuget
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuget-packages-${{ inputs.version }}
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+            artifacts/nuget/provenance.json
+          if-no-files-found: error
+
+      - name: Summarise NuGet packages
+        env:
+          SOURCE_REF: ${{ inputs.ref }}
+          ARTIFACT_URL: ${{ steps.upload-nuget.outputs.artifact-url }}
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os
+          from pathlib import Path
+          import subprocess
+          import xml.etree.ElementTree as ET
+          import zipfile
+
+          print('### NuGet packages\n')
+          print('```text')
+          print(f'Requested version: {os.environ["PACKAGE_VERSION"]}')
+          print(f'Source ref: {os.environ["SOURCE_REF"]}')
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          print(f'Commit: {commit}')
+          print(f'Artifact: nuget-packages-{os.environ["PACKAGE_VERSION"]}')
+          for package in sorted(Path('artifacts/nuget').glob('*.nupkg')):
+              with zipfile.ZipFile(package) as archive:
+                  nuspec = next(name for name in archive.namelist() if name.endswith('.nuspec'))
+                  root = ET.fromstring(archive.read(nuspec))
+                  metadata = root.find('{*}metadata')
+                  print(f'\nPackage: {package.name} ({package.stat().st_size:,} bytes)')
+                  for field in ('id', 'version', 'tags'):
+                      value = metadata.findtext(f'{{*}}{field}') or '(none)'
+                      print(f'  {field}: {value}')
+          for symbols in sorted(Path('artifacts/nuget').glob('*.snupkg')):
+              print(f'\nSymbols: {symbols.name} ({symbols.stat().st_size:,} bytes)')
+          print('```\n')
+          print(f'[Download workflow artifact]({os.environ["ARTIFACT_URL"]})')
+          PY
