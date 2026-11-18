@@ -1,0 +1,114 @@
+name: 'Test and Sonar'
+description: >-
+  Builds and tests a .NET solution with coverage under the SonarScanner for .NET, then checks the
+  SonarCloud quality gate. Skips the analysis for Dependabot pull request validation.
+
+inputs:
+  version:
+    description: 'Version reported to SonarCloud'
+    required: true
+  ref:
+    description: >-
+      Git ref to check out, with all history and tags, before analysis. Empty to use the repository already
+      checked out in the workspace, which needs full history (fetch-depth: 0) for blame information.
+    required: false
+    default: ''
+  branch:
+    description: 'Branch name for branch analysis; omit for pull request analysis'
+    required: false
+    default: ''
+  sonar-exclusions:
+    description: 'Comma-separated sonar.exclusions patterns'
+    required: false
+    default: '.github/**,tests/Endpoints/**'
+  sonar-token:
+    # Optional so Dependabot pull requests, whose secrets store has no LIS_SONAR_TOKEN, can use this
+    # action; the Sonar steps are skipped for that actor during PR validation. Merged releases are analysed.
+    description: 'SonarCloud token, normally secrets.LIS_SONAR_TOKEN'
+    required: false
+    default: ''
+  github-token:
+    description: 'Token the scanner uses to read pull request information'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  quality-gate-status:
+    description: 'SonarCloud quality gate result (PASSED, WARN or FAILED; empty for Dependabot PR validation)'
+    value: ${{ steps.quality_gate.outputs.quality-gate-status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Setup Node
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v7.1.0
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+
+    - name: Cache SonarQube Cloud packages
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ./.sonar/cache
+        key: ${{ runner.os }}-sonar
+        restore-keys: ${{ runner.os }}-sonar
+
+    - name: Cache SonarQube Cloud scanner
+      id: cache-sonar-scanner
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ./.sonar/scanner
+        key: ${{ runner.os }}-sonar-scanner
+        restore-keys: ${{ runner.os }}-sonar-scanner
+
+    - name: Run tests with coverage
+      shell: bash
+      run: npm run test:coverage
+
+    - name: Verify LCOV coverage
+      shell: bash
+      run: >-
+        if [[ ! -s coverage/lcov.info ]]; then
+          echo "coverage/lcov.info was not created or is empty." >&2
+          exit 1
+        fi
+        
+        if ! grep -q '^SF:' coverage/lcov.info; then
+          echo "coverage/lcov.info contains no source records." >&2
+          exit 1
+        fi
+
+    - name: SonarCloud Scan
+      # Dependabot pull requests run with the Dependabot secrets store, so
+      # LIS_SONAR_TOKEN is unavailable; skip analysis rather than fail.
+      if: github.actor != 'dependabot[bot]'
+      uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 #v8.4.0
+      with:
+        args: >-
+          -Dsonar.projectVersion=${{ inputs.version }}
+          ${{ inputs.branch != '' && format('-Dsonar.branch.name={0}', inputs.branch) || '' }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.LIS_SONAR_TOKEN }}
+
+    - name: SonarCloud Quality Gate check
+      id: quality_gate
+      if: github.actor != 'dependabot[bot]'
+      uses: SonarSource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b #v1.20
+      timeout-minutes: 5
+      with:
+        scanMetadataReportFile: .scannerwork/report-task.txt
+      env:
+        SONAR_TOKEN: ${{ secrets.LIS_SONAR_TOKEN }}
+        SONAR_HOST_URL: https://sonarcloud.io
