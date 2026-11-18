@@ -2,6 +2,47 @@
 
 Shared, reusable GitHub Actions workflows for the Livestock Information Service (LIS) repositories.
 
+## Actions
+
+Composite actions run as a step inside the caller's own job, so they need no extra runner.
+
+| Action           | Purpose                                                                                                          | Inputs                                                                                                                             |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `actions/version` | Calculates the SemVer version from the latest stable tag and the branch name; outputs `version`                 | `ref` (empty to use the workspace's existing checkout), `branch`, `release-type` (`prerelease` or `stable`)                        |
+| `actions/build-test-dotnet` | Builds and tests the solution; packs and uploads NuGet packages when a project is packable; builds, smoke tests and uploads the production image when there is a `Dockerfile`; outputs `has-dockerfile`, `has-nuget`, `image-ref`, `image-artifact`, `nuget-artifact-url` | `version`, `ref` (empty to use the workspace's existing checkout), `smoke-port` (`3000`), `smoke-env` (one `KEY=VALUE` per line), `smoke-postgres` (`false`) |
+| `actions/publish-nuget` | Checks out the version tag, finds the `nuget-packages-<version>` artifact a successful `prerelease.yml` or `release.yml` run built for that commit, verifies its provenance, waits for that run to succeed and pushes the packages to NuGet.org with trusted publishing; outputs `build-run-id` | `version`, `nuget-username`, `github-token` (`github.token`) |
+| `actions/sonar-dotnet` | Builds and tests with coverage under the SonarScanner for .NET and checks the SonarCloud quality gate; skipped for Dependabot pull request validation; outputs `quality-gate-status` | `version`, `ref` (empty to use the workspace's existing checkout, which needs `fetch-depth: 0`), `branch` (empty for pull request analysis), `sonar-exclusions` (`.github/**,tests/Endpoints/**`), `sonar-token` (pass `secrets.LIS_SONAR_TOKEN`), `github-token` (`github.token`) |
+| `actions/tag` | Checks out `ref` with the LIS release GitHub App token, tags it with `version` and pushes the tag, so the push triggers the repository's tag workflows | `version`, `ref`, `app-client-id` (pass `vars.LIS_RELEASE_APP_CLIENT_ID`), `app-private-key` (pass `secrets.LIS_RELEASE_APP_PRIVATE_KEY`) |
+
+With `ref` set, `actions/version` checks out that ref with all history and tags, replacing whatever the
+job had checked out. Leave `ref` empty to calculate from a checkout the job already made; the action then
+fetches the tags itself.
+
+`actions/build-test-dotnet` names the image artifact `container-image-<commit SHA>` after the commit it
+built, which is what `container-publish.yml` looks up, and the NuGet artifact `nuget-packages-<version>`,
+which is what `actions/publish-nuget` looks up. It needs `jq`, `python3` and Docker on the runner
+(`ubuntu-latest` has them).
+
+An action cannot set job settings, so the job running `actions/publish-nuget` must grant
+`actions: read` (to find and download the artifact) and `id-token: write` (for trusted publishing),
+and should run in the `release` environment that holds `NUGET_USERNAME`:
+
+```yaml
+jobs:
+  publish-nuget:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: DEFRA/lis-github-actions/actions/publish-nuget@0.10.0
+        with:
+          version: ${{ github.ref_name }}
+          nuget-username: ${{ secrets.NUGET_USERNAME }}
+```
+
 ## Workflows
 
 `workflow_call` workflows replace the per-repository `support-*.yml` copies. A calling repository
@@ -13,10 +54,8 @@ of that language that ship a container image, and `npm-package-*` the npm packag
 
 | Workflow                     | Purpose                                                                                                  | Inputs                                                                                                                                    |
 | ---------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `version.yml`   | Calculates the SemVer version from the branch name and tags with `version.cake`; outputs `version`       | `ref`, `branch`, `release-type` (`prerelease` or `stable`)                                                                                |
 | `node-service-validate.yml`  | Runs the `Build` cake target and, alongside it, builds the production image with a layer cache, smoke tests `/health` and uploads the image | `version`, `ref`, `smoke-port` (`3000`), `smoke-env` (one `KEY=VALUE` per line), `health-path` (`/health`), `dockerfile`, `image-target` |
 | `node-sonar.yml`     | Runs tests with coverage and SonarCloud; outputs `quality-gate-status`                                   | `version`, `ref`, `branch`, `test-command` (`npm run test:coverage`); secret `LIS_SONAR_TOKEN`                                            |
-| `tag.yml`       | Tags `ref` with `version` using the LIS release GitHub App                                               | `version`, `ref`                                                                                                                          |
 | `dotnet-service-validate.yml` | Runs an optional pre-build cake script, the `Build` cake target, builds the image with `PackOnly`, smoke tests and uploads it | `version`, `ref`, `pre-build-cake-script`, `pre-build-cake-target` (`Default`), `smoke-port` (`3000`), `smoke-env`, `smoke-postgres` (`false`), `health-path` |
 | `dotnet-sonar.yml`           | Builds, tests with OpenCover coverage and runs SonarCloud; outputs `quality-gate-status`                  | `version`, `ref`, `branch`, `sonar-exclusions`; secret `LIS_SONAR_TOKEN`                                                                  |
 | `npm-package-validate.yml`   | Runs the `Build` cake target for an npm package                                                          | `version`, `ref`                                                                                                                          |
@@ -46,19 +85,27 @@ jobs:
 
 The calling repository must contain `version.cake`, `base.cake` and `build.cake` (plus `.nvmrc` and a
 `Dockerfile` for Node.js services); the workflows check out the caller and run those scripts there. Secrets and
-variables (`LIS_SONAR_TOKEN`, `LIS_RELEASE_APP_CLIENT_ID`, `LIS_RELEASE_APP_PRIVATE_KEY`,
-`AWS_*`) resolve in the calling repository, so pass `secrets: inherit`.
+variables (`LIS_SONAR_TOKEN`, `AWS_*`) resolve in the calling repository, so pass `secrets: inherit`.
+Actions cannot read the caller's secrets, so pass them as inputs instead, for example
+`app-private-key: ${{ secrets.LIS_RELEASE_APP_PRIVATE_KEY }}` to `actions/tag`.
 
 ### Example caller
 
 ```yaml
 jobs:
   get-version:
-    uses: DEFRA/lis-github-actions/.github/workflows/version.yml@0.1.0
-    with:
-      ref: ${{ github.event.pull_request.head.sha }}
-      branch: ${{ github.event.pull_request.head.ref }}
-      release-type: prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        uses: DEFRA/lis-github-actions/actions/version@0.10.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          branch: ${{ github.event.pull_request.head.ref }}
+          release-type: prerelease
 
   validate:
     needs: get-version

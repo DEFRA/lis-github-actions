@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Calculates the SemVer version from the latest stable tag and the branch name.
+# Reads VERSION_BRANCH and RELEASE_TYPE; writes `version` to GITHUB_OUTPUT and a
+# summary to GITHUB_STEP_SUMMARY.
+set -euo pipefail
+export LC_ALL=C
+
+case "$RELEASE_TYPE" in
+  stable|prerelease) ;;
+  *) echo 'release-type must be stable or prerelease' >&2; exit 1 ;;
+esac
+case "$VERSION_BRANCH" in
+  feature/*|hotfix/*|dependabot/*) ;;
+  *) echo 'branch must start with feature/, hotfix/ or dependabot/' >&2; exit 1 ;;
+esac
+
+# Compare numeric SemVer components, ignoring all prerelease tags.
+# Accept an optional v prefix and SemVer build metadata.
+stable_pattern='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+tags=$(git tag --list)
+stable_tags=''
+while IFS= read -r tag; do
+  if [[ "$tag" =~ $stable_pattern ]]; then
+    stable_tags+="${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]} $tag"$'\n'
+  fi
+done <<< "$tags"
+
+# Bootstrap repositories that have not published a stable version yet.
+major=0
+minor=0
+patch=0
+base_tag=0.0.0
+if [[ -n "$stable_tags" ]]; then
+  sorted_tags=$(printf '%s' "$stable_tags" | sort -k1,1nr -k2,2nr -k3,3nr)
+  read -r major minor patch base_tag <<< "$sorted_tags"
+fi
+
+if [[ "$VERSION_BRANCH" == feature/* ]]; then
+  minor=$((minor + 1))
+  patch=0
+else
+  patch=$((patch + 1))
+fi
+version="$major.$minor.$patch"
+
+if [[ "$RELEASE_TYPE" == prerelease ]]; then
+  if [[ "$VERSION_BRANCH" == dependabot/* ]]; then
+    ticket=dependabot
+  else
+    branch_name=$(printf '%s' "${VERSION_BRANCH#*/}" | tr '[:lower:]' '[:upper:]')
+    ticket_pattern='(^|[^A-Z0-9])(LREG-[0-9]+)($|[^A-Z0-9])'
+    if [[ ! "$branch_name" =~ $ticket_pattern ]]; then
+      echo 'prerelease branch must contain an LREG ticket (for example LREG-123)' >&2
+      exit 1
+    fi
+    ticket="${BASH_REMATCH[2]}"
+  fi
+  version+="-$ticket-alpha.$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
+fi
+
+printf 'Base stable tag: %s; calculated version: %s\n' "$base_tag" "$version"
+printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+{
+  printf '### Calculated version\n\n```text\n'
+  printf 'Version: %s\n' "$version"
+  printf 'Base stable tag: %s\n' "$base_tag"
+  printf 'Release type: %s\n' "$RELEASE_TYPE"
+  printf 'Branch: %s\n' "$VERSION_BRANCH"
+  printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+  printf '```\n'
+} | tee -a "$GITHUB_STEP_SUMMARY"

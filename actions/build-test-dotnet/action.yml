@@ -1,0 +1,205 @@
+name: 'Build and Test dotnet projects'
+description: >-
+  Builds and tests a .NET solution, then packs and uploads NuGet packages when a project is packable and
+  builds, smoke tests and uploads the production container image when the repository has a Dockerfile
+
+inputs:
+  version:
+    description: 'Version to build, pack and label the image with'
+    required: true
+  ref:
+    description: >-
+      Git ref or commit SHA to check out before building. Empty to use the repository already checked out
+      in the workspace.
+    required: false
+    default: ''
+  smoke-port:
+    description: 'Port the service listens on inside the container (ASPNETCORE_URLS); published on 3101 for the health check'
+    required: false
+    default: '3000'
+  smoke-env:
+    description: 'Extra environment for the smoke test, one KEY=VALUE per line'
+    required: false
+    default: ''
+  smoke-postgres:
+    description: 'Start a PostgreSQL sidecar reachable as host "postgres" (database, user and password "smoke"); true or false'
+    required: false
+    default: 'false'
+
+outputs:
+  has-dockerfile:
+    description: 'Whether the repository has a Dockerfile, and so whether the image was built and tested'
+    value: ${{ steps.detect-docker.outputs.has-dockerfile }}
+  has-nuget:
+    description: 'Whether any project is packable, and so whether NuGet packages were produced'
+    value: ${{ steps.detect-nuget.outputs.has-nuget }}
+  image-ref:
+    description: 'Local tag of the tested container image; empty without a Dockerfile'
+    value: ${{ steps.image.outputs.ref }}
+  image-artifact:
+    description: 'Name of the uploaded container image artifact; empty without a Dockerfile'
+    value: ${{ steps.image.outputs.artifact }}
+  nuget-artifact-url:
+    description: 'URL of the uploaded NuGet packages artifact; empty without packable projects'
+    value: ${{ steps.upload-nuget.outputs.artifact-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      if: ${{ inputs.ref != '' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.ref }}
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.0.1
+      with:
+        global-json-file: global.json
+
+    - name: Check for Dockerfile
+      id: detect-docker
+      shell: bash
+      run: |
+        if [[ -f Dockerfile ]]; then
+          echo "has-dockerfile=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-dockerfile=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Check for NuGet projects
+      id: detect-nuget
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/detect-nuget.sh"'
+
+    - name: Build solution
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: dotnet build --configuration Release -p:Version="$PACKAGE_VERSION"
+
+    - name: Run solution tests
+      shell: bash
+      run: dotnet test --configuration Release --no-build
+
+    # NuGet packages
+
+    - name: Pack NuGet packages
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: >-
+        dotnet pack --configuration Release --no-build
+        -p:Version="$PACKAGE_VERSION"
+        --output artifacts/nuget
+
+    - name: Record package provenance
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        packages=(artifacts/nuget/*.nupkg)
+        if [[ ! -f "${packages[0]}" ]]; then
+          echo 'No NuGet packages were produced.' >&2
+          exit 1
+        fi
+        jq -n \
+          --arg commit "$(git rev-parse HEAD)" \
+          --arg version "$PACKAGE_VERSION" \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+          '{commit: $commit, version: $version, run_id: $run_id, run_attempt: $run_attempt}' \
+          > artifacts/nuget/provenance.json
+
+    - name: Upload NuGet packages
+      id: upload-nuget
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: nuget-packages-${{ inputs.version }}
+        path: |
+          artifacts/nuget/*.nupkg
+          artifacts/nuget/*.snupkg
+          artifacts/nuget/provenance.json
+        if-no-files-found: error
+
+    - name: Summarise NuGet packages
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+        SOURCE_REF: ${{ inputs.ref }}
+        ARTIFACT_URL: ${{ steps.upload-nuget.outputs.artifact-url }}
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/summarise-nuget.py" | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # Container image
+
+    - name: Set up Docker Buildx
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Prepare image metadata
+      id: image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE_NAME: ${{ github.event.repository.name }}
+      shell: bash
+      run: |
+        # Name the image after the commit checked out, so it matches what container-publish looks up.
+        revision=$(git rev-parse HEAD)
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+        echo "ref=$IMAGE_NAME:build-$revision" >> "$GITHUB_OUTPUT"
+        echo "artifact=container-image-$revision" >> "$GITHUB_OUTPUT"
+
+    - name: Build docker image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        target: production
+        no-cache: true
+        provenance: false
+        sbom: false
+        load: true
+        tags: |
+          ${{ steps.image.outputs.ref }}
+        labels: |
+          defra.cdp.git.repo.url=https://github.com/DEFRA/${{ github.event.repository.name }}
+          defra.cdp.git.repo.name=${{ github.event.repository.name }}
+          defra.cdp.service.name=${{ github.event.repository.name }}
+          defra.cdp.build.run_id=${{ github.run_id }}
+          defra.cdp.run_mode=service
+          git.hash=${{ steps.image.outputs.revision }}
+          org.opencontainers.image.version=${{ inputs.version }}
+
+    - name: Smoke test production image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE: ${{ steps.image.outputs.ref }}
+        PORT: ${{ inputs.smoke-port }}
+        SMOKE_ENV: ${{ inputs.smoke-env }}
+        SMOKE_POSTGRES: ${{ inputs.smoke-postgres }}
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/smoke-test.sh"'
+
+    - name: Export tested image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE: ${{ steps.image.outputs.ref }}
+      shell: bash
+      run: |
+        mkdir container-artifact
+        docker image inspect "$IMAGE" --format '{{.Id}}' > container-artifact/image-id.txt
+        printf '%s\n' "$IMAGE" > container-artifact/image-ref.txt
+        docker save --output container-artifact/image.tar "$IMAGE"
+
+    - name: Upload tested image artifact
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.image.outputs.artifact }}
+        path: container-artifact
+        if-no-files-found: error
+        compression-level: 0
