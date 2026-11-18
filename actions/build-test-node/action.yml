@@ -109,15 +109,15 @@ runs:
 
     - name: Checks formatting
       shell: bash
-      run: run format:check
+      run: npm run format:check
 
     - name: Runs JavaScript linting
       shell: bash
-      run: npm lint
+      run: npm run lint --if-present
 
     - name: Run tests
       shell: bash
-      run: npm test
+      run: npm run test
 
     # npm package
     - name: Pack npm package
@@ -127,6 +127,7 @@ runs:
         PACKAGE_VERSION: ${{ inputs.version }}
       shell: bash
       run: |
+        mkdir -p artifacts/npm
         npm pack --pack-destination artifacts/npm
 
         packages=(artifacts/npm/*.tgz)
@@ -156,13 +157,12 @@ runs:
     - name: Summarise npm package
       if: ${{ steps.detect-npm.outputs.has-npm-package == 'true' }}
       env:
-        PACKAGE_DIR: ${{ steps.pack-npm.outputs.path }}
         PACKAGE_VERSION: ${{ inputs.version }}
         SOURCE_REF: ${{ inputs.ref }}
         ARTIFACT: ${{ steps.pack-npm.outputs.artifact }}
         ARTIFACT_URL: ${{ steps.upload-npm.outputs.artifact-url }}
       shell: bash
-      run: '"$GITHUB_ACTION_PATH/summarise-npm.sh" | tee -a "$GITHUB_STEP_SUMMARY"'
+      run: python3 "$GITHUB_ACTION_PATH/summarise-npm.py" | tee -a "$GITHUB_STEP_SUMMARY"
 
     # Container image
 
