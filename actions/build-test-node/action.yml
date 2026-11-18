@@ -109,15 +109,15 @@ runs:
 
     - name: Checks formatting
       shell: bash
-      run: run format:check
+      run: npm run format:check
 
     - name: Runs JavaScript linting
       shell: bash
-      run: npm lint
+      run: npm run lint --if-present
 
     - name: Run tests
       shell: bash
-      run: npm test
+      run: npm run test
 
     # npm package
     - name: Pack npm package
@@ -127,6 +127,7 @@ runs:
         PACKAGE_VERSION: ${{ inputs.version }}
       shell: bash
       run: |
+        mkdir -p artifacts/npm
         npm pack --pack-destination artifacts/npm
 
         packages=(artifacts/npm/*.tgz)
