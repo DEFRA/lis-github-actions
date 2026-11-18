@@ -11,6 +11,7 @@ Composite actions run as a step inside the caller's own job, so they need no ext
 | `actions/version` | Calculates the SemVer version from the latest stable tag and the branch name; outputs `version`                 | `ref` (empty to use the workspace's existing checkout), `branch`, `release-type` (`prerelease` or `stable`)                        |
 | `actions/build-test-dotnet` | Validates and applies the Liquibase changelog against a throwaway PostgreSQL when one exists; builds and tests the solution; once all of that passes, packages the changelog folder with its `db-migration-metadata:1.0.0` metadata and uploads it as `database-migrations-<version>`; packs and uploads NuGet packages when a project is packable; builds, smoke tests and uploads the production image when there is a `Dockerfile`; outputs `has-dockerfile`, `has-liquibase` (a changelog exists at `liquibase-changelog`), `migrations-artifact`, `migrations-artifact-url`, `has-nuget`, `image-ref`, `image-artifact`, `nuget-artifact-url` | `version`, `ref` (empty to use the workspace's existing checkout), `smoke-port` (`3000`), `smoke-env` (one `KEY=VALUE` per line), `smoke-postgres` (`auto`: on when a Liquibase changelog is detected; `true` or `false` to force), `liquibase-changelog` (`changelog/db.changelog.xml`; `liquibase.properties` beside it must set `liquibase.command.username`), `liquibase-version` (`5.0.1`), `liquibase-database` (`dbname`) |
 | `actions/build-test-node` | Sets `version` in `package.json`, runs `npm ci`, the build and the tests; packs and uploads the package as `npm-packages-<version>` when `package.json` is not `"private": true`; builds (with a layer cache), smoke tests and uploads the production image when there is a `Dockerfile`; outputs `has-dockerfile`, `has-npm-package`, `image-ref`, `image-artifact`, `npm-artifact-url` | `version`, `ref` (empty to use the workspace's existing checkout), `build-command` (`npm run build --if-present`), `test-command` (`npm test`), `dockerfile` (`./Dockerfile`), `image-target` (`production`), `smoke-port` (`3000`, passed as `PORT` and published on the same host port), `health-path` (`/health`), `smoke-env` (one `KEY=VALUE` per line), `smoke-postgres` (`false`; `true` starts a PostgreSQL sidecar reachable as `postgres`) |
+| `actions/publish-npm` | Checks out the version tag, finds the `npm-packages-<version>` artifact a successful `prerelease.yml` or `release.yml` run built for that commit (uploaded by `actions/build-test-node`), verifies its provenance and that the package version matches the tag, waits for that run to succeed and publishes the package to npmjs with trusted publishing; outputs `build-run-id`, `dist-tag` | `version`, `dist-tag` (empty for `alpha` on a prerelease, `latest` on a stable version), `github-token` (`github.token`) |
 | `actions/publish-nuget` | Checks out the version tag, finds the `nuget-packages-<version>` artifact a successful `prerelease.yml` or `release.yml` run built for that commit, verifies its provenance, waits for that run to succeed and pushes the packages to NuGet.org with trusted publishing; outputs `build-run-id` | `version`, `nuget-username`, `github-token` (`github.token`) |
 | `actions/sonar-dotnet` | Builds and tests with coverage under the SonarScanner for .NET and checks the SonarCloud quality gate; skipped for Dependabot pull request validation; outputs `quality-gate-status` | `version`, `ref` (empty to use the workspace's existing checkout, which needs `fetch-depth: 0`), `branch` (empty for pull request analysis), `sonar-exclusions` (`.github/**,tests/Endpoints/**`), `sonar-token` (pass `secrets.LIS_SONAR_TOKEN`), `github-token` (`github.token`) |
 | `actions/sonar-node` | Runs `npm ci` and the tests with LCOV coverage, checks `coverage/lcov.info` has source records, analyses with the SonarScanner CLI and checks the SonarCloud quality gate; skipped for Dependabot pull request validation; outputs `quality-gate-status`. The calling repository needs a `sonar-project.properties` with the project key and organisation | `version`, `ref` (empty to use the workspace's existing checkout, which needs `fetch-depth: 0`), `branch` (empty for pull request analysis), `test-command` (`npm run test:coverage`), `sonar-exclusions` (empty to use `sonar-project.properties`), `sonar-token` (pass `secrets.LIS_SONAR_TOKEN`), `github-token` (`github.token`) |
@@ -43,6 +44,25 @@ jobs:
         with:
           version: ${{ github.ref_name }}
           nuget-username: ${{ secrets.NUGET_USERNAME }}
+```
+
+The job running `actions/publish-npm` needs the same `actions: read` and `id-token: write`
+permissions. The package on npmjs must have a trusted publisher that names this repository and
+the calling workflow file (for example `publish.yml`); with a composite action, npm sees the
+caller's workflow, not this repository's.
+
+```yaml
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: DEFRA/lis-github-actions/actions/publish-npm@0.10.0
+        with:
+          version: ${{ github.ref_name }}
 ```
 
 ## Workflows
