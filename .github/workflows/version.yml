@@ -4,15 +4,15 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: 'Git ref (branch name) to check out before calculating the version'
+        description: 'Git ref to check out before calculating the version'
         required: true
         type: string
       branch:
-        description: 'Feature or hotfix branch used to determine the release type'
+        description: 'Feature, hotfix or Dependabot branch used to determine the version bump'
         required: true
         type: string
       release-type:
-        description: 'Whether to calculate a prerelease or stable version'
+        description: 'Either prerelease or stable'
         required: false
         type: string
         default: 'prerelease'
@@ -31,25 +31,84 @@ jobs:
     outputs:
       version: ${{ steps.calculate_version.outputs.version }}
     steps:
-      - name: Checkout code
+      - name: Checkout code and all tags
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v6
-        with:
-          dotnet-version: '10.0.x'
-
-      - name: Calculate Version
+      - name: Calculate version from the latest stable tag
         id: calculate_version
-        uses: cake-build/cake-action@ba3e4038094f93cd11603648f97d23d1ca7058b8 # master after v3.0.1: runs on node24 (unreleased)
-        with:
-          cake-version: 6.3.0
-          script-path: ./version.cake
-          target: GetVersion
-          arguments: |
-            branch: ${{ inputs.branch }}
-            release_type: ${{ inputs.release-type }}
+        env:
+          VERSION_BRANCH: ${{ inputs.branch }}
+          RELEASE_TYPE: ${{ inputs.release-type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          case "$RELEASE_TYPE" in
+            stable|prerelease) ;;
+            *) echo 'release-type must be stable or prerelease' >&2; exit 1 ;;
+          esac
+          case "$VERSION_BRANCH" in
+            feature/*|hotfix/*|dependabot/*) ;;
+            *) echo 'branch must start with feature/, hotfix/ or dependabot/' >&2; exit 1 ;;
+          esac
+
+          # Compare numeric SemVer components, ignoring all prerelease tags.
+          # Accept an optional v prefix and SemVer build metadata.
+          stable_pattern='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          tags=$(git tag --list)
+          stable_tags=''
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ $stable_pattern ]]; then
+              stable_tags+="${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]} $tag"$'\n'
+            fi
+          done <<< "$tags"
+
+          # Bootstrap repositories that have not published a stable version yet.
+          major=0
+          minor=0
+          patch=0
+          base_tag=0.0.0
+          if [[ -n "$stable_tags" ]]; then
+            sorted_tags=$(printf '%s' "$stable_tags" | sort -k1,1nr -k2,2nr -k3,3nr)
+            read -r major minor patch base_tag <<< "$sorted_tags"
+          fi
+
+          if [[ "$VERSION_BRANCH" == feature/* ]]; then
+            minor=$((minor + 1))
+            patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          version="$major.$minor.$patch"
+
+          if [[ "$RELEASE_TYPE" == prerelease ]]; then
+            if [[ "$VERSION_BRANCH" == dependabot/* ]]; then
+              ticket=dependabot
+            else
+              branch_name=$(printf '%s' "${VERSION_BRANCH#*/}" | tr '[:lower:]' '[:upper:]')
+              ticket_pattern='(^|[^A-Z0-9])(LREG-[0-9]+)($|[^A-Z0-9])'
+              if [[ ! "$branch_name" =~ $ticket_pattern ]]; then
+                echo 'prerelease branch must contain an LREG ticket (for example LREG-123)' >&2
+                exit 1
+              fi
+              ticket="${BASH_REMATCH[2]}"
+            fi
+            version+="-$ticket-alpha.$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
+          fi
+
+          printf 'Base stable tag: %s; calculated version: %s\n' "$base_tag" "$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Calculated version\n\n```text\n'
+            printf 'Version: %s\n' "$version"
+            printf 'Base stable tag: %s\n' "$base_tag"
+            printf 'Release type: %s\n' "$RELEASE_TYPE"
+            printf 'Branch: %s\n' "$VERSION_BRANCH"
+            printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+            printf '```\n'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

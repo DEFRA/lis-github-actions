@@ -22,4 +22,4 @@ jobs:
           ref: ${{ inputs.ref }}
 
       - name: Lint workflows with actionlint
-        run: docker run --rm --volume "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.7 -color
+        run: docker run --rm --volume "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color

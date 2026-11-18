@@ -1,0 +1,131 @@
+name: "Publish NuGet"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version tag identifying the package artifact to publish'
+        required: true
+        type: string
+    secrets:
+      NUGET_USERNAME:
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  publish-nuget:
+    name: "Publish NuGet"
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Checkout version tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.version }}
+          persist-credentials: false
+
+      - name: Find package build artifact
+        id: find-artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: nuget-packages-${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tagged_commit=$(git rev-parse HEAD)
+          artifacts=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts" \
+            -f name="$ARTIFACT_NAME" -f per_page=100 --paginate --slurp)
+          candidates=$(jq -r --arg name "$ARTIFACT_NAME" \
+            '[.[].artifacts[] | select(.name == $name and .expired == false)]
+             | sort_by(.created_at) | reverse | .[] | [.id, .workflow_run.id] | @tsv' \
+            <<< "$artifacts")
+
+          while IFS=$'\t' read -r artifact_id run_id; do
+            [[ -n "$artifact_id" ]] || continue
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+            # PR validation also uploads packages; only publish release builds.
+            if ! jq -e --arg commit "$tagged_commit" '
+              .head_sha == $commit and
+              (.status != "completed" or .conclusion == "success") and (
+              (.path == ".github/workflows/prerelease.yml" and .event == "push") or
+              (.path == ".github/workflows/release.yml" and .event == "pull_request"))
+            ' <<< "$run" > /dev/null; then
+              continue
+            fi
+            printf 'artifact-id=%s\nrun-id=%s\n' "$artifact_id" "$run_id" >> "$GITHUB_OUTPUT"
+            {
+              printf '### Package artifact source\n\n'
+              printf "Artifact: \`%s\`\n\n" "$ARTIFACT_NAME"
+              printf '[Build run](%s/%s/actions/runs/%s)\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$run_id"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          done <<< "$candidates"
+
+          echo "No unexpired release artifact named $ARTIFACT_NAME was found. Rebuild the version before publishing." >&2
+          exit 1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.0.1
+        with:
+          dotnet-version: latest
+          dotnet-quality: ga
+          check-latest: true
+
+      - name: Download NuGet packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ steps.find-artifact.outputs.artifact-id }}
+          run-id: ${{ steps.find-artifact.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify package provenance and completed validation
+        timeout-minutes: 12
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+          BUILD_RUN_ID: ${{ steps.find-artifact.outputs.run-id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tagged_commit=$(git rev-parse HEAD)
+          jq -e --arg commit "$tagged_commit" \
+            --arg version "$PACKAGE_VERSION" --arg run_id "$BUILD_RUN_ID" '
+            .commit == $commit and .version == $version and .run_id == $run_id and
+            (.run_attempt | test("^[1-9][0-9]*$"))
+          ' artifacts/provenance.json > /dev/null
+          attempt=$(jq -r '.run_attempt' artifacts/provenance.json)
+
+          # Pushing the tag starts this workflow before the tagging run finishes.
+          # Check the exact attempt that uploaded the artifact, including on reruns.
+          for _ in {1..60}; do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/attempts/$attempt")
+            if [[ $(jq -r '.status' <<< "$run") == completed ]]; then
+              if jq -e '.conclusion == "success"' <<< "$run" > /dev/null; then
+                exit 0
+              fi
+              echo 'The package build workflow did not succeed.' >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo 'Timed out waiting for package validation to complete.' >&2
+          exit 1
+
+      - name: NuGet trusted publishing login
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ secrets.NUGET_USERNAME }}
+
+      - name: Push to NuGet.org
+        run: |
+          dotnet nuget push "artifacts/*.nupkg" \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+            --source "https://api.nuget.org/v3/index.json" \
+            --skip-duplicate
