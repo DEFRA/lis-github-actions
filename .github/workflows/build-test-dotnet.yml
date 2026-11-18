@@ -149,7 +149,7 @@ jobs:
           database=''
           container=''
 
-          # shellcheck disable=SC2317 # invoked by the EXIT trap
+          # shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
           cleanup() {
             if [[ -n "$container" ]]; then
               docker logs "$container" || true

@@ -59,7 +59,7 @@ jobs:
             printf 'artifact-id=%s\nrun-id=%s\n' "$artifact_id" "$run_id" >> "$GITHUB_OUTPUT"
             {
               printf '### Package artifact source\n\n'
-              printf 'Artifact: `%s`\n\n' "$ARTIFACT_NAME"
+              printf "Artifact: \`%s\`\n\n" "$ARTIFACT_NAME"
               printf '[Build run](%s/%s/actions/runs/%s)\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$run_id"
             } | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
