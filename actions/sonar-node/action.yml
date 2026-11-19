@@ -1,0 +1,119 @@
+name: 'Test and Sonar'
+description: >-
+  Installs a Node.js project, runs its tests with LCOV coverage and analyses it with the SonarScanner CLI,
+  then checks the SonarCloud quality gate. Skips the analysis for Dependabot pull request validation.
+
+inputs:
+  version:
+    description: 'Version reported to SonarCloud'
+    required: true
+  ref:
+    description: >-
+      Git ref to check out, with all history and tags, before analysis. Empty to use the repository already
+      checked out in the workspace, which needs full history (fetch-depth: 0) for blame information.
+    required: false
+    default: ''
+  branch:
+    description: 'Branch name for branch analysis; omit for pull request analysis'
+    required: false
+    default: ''
+  test-command:
+    description: 'Command that runs the tests and writes coverage/lcov.info'
+    required: false
+    default: 'npm run test:coverage'
+  sonar-exclusions:
+    description: >-
+      Comma-separated sonar.exclusions patterns. Empty to leave exclusions to the repository's
+      sonar-project.properties, which a value here overrides
+    required: false
+    default: ''
+  sonar-token:
+    # Optional so Dependabot pull requests, whose secrets store has no LIS_SONAR_TOKEN, can use this
+    # action; the Sonar steps are skipped for that actor during PR validation. Merged releases are analysed.
+    description: 'SonarCloud token, normally secrets.LIS_SONAR_TOKEN'
+    required: false
+    default: ''
+  github-token:
+    description: 'Token the scanner uses to read pull request information'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  quality-gate-status:
+    description: 'SonarCloud quality gate result (PASSED, WARN or FAILED; empty for Dependabot PR validation)'
+    value: ${{ steps.quality_gate.outputs.quality-gate-status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      if: ${{ inputs.ref != '' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+        fetch-tags: true
+
+    # The scan takes the project key and organisation from this file, so fail before the install and tests.
+    - name: Check for sonar-project.properties
+      shell: bash
+      run: |
+        if [[ ! -f sonar-project.properties ]]; then
+          echo "::error::sonar-project.properties not found in the repository root. Add one that sets sonar.projectKey and sonar.organization." >&2
+          exit 1
+        fi
+
+    - name: Setup Node
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+
+    - name: Run tests with coverage
+      env:
+        TEST_COMMAND: ${{ inputs.test-command }}
+      shell: bash
+      run: eval "$TEST_COMMAND"
+
+    - name: Verify LCOV coverage
+      shell: bash
+      run: |
+        if [[ ! -s coverage/lcov.info ]]; then
+          echo "coverage/lcov.info was not created or is empty." >&2
+          exit 1
+        fi
+
+        if ! grep -q '^SF:' coverage/lcov.info; then
+          echo "coverage/lcov.info contains no source records." >&2
+          exit 1
+        fi
+
+    # Dependabot pull requests run with the Dependabot secrets store, so LIS_SONAR_TOKEN is
+    # unavailable; skip analysis rather than fail, but still analyse the merged release.
+    - name: SonarCloud Scan
+      if: ${{ github.actor != 'dependabot[bot]' || github.event.action == 'closed' }}
+      uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4 # v8.5.0
+      with:
+        args: >-
+          -Dsonar.projectVersion=${{ inputs.version }}
+          ${{ inputs.sonar-exclusions != '' && format('-Dsonar.exclusions={0}', inputs.sonar-exclusions) || '' }}
+          ${{ inputs.branch != '' && format('-Dsonar.branch.name={0}', inputs.branch) || '' }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+
+    - name: SonarCloud Quality Gate check
+      id: quality_gate
+      if: ${{ github.actor != 'dependabot[bot]' || github.event.action == 'closed' }}
+      uses: SonarSource/sonarqube-quality-gate-action@7a5fffe8e523c40e0c740b6bc2712ab503e52efa # v1.2.1
+      with:
+        scanMetadataReportFile: .scannerwork/report-task.txt
+        # Composite steps cannot set timeout-minutes; bound the gate's polling instead.
+        pollingTimeoutSec: 300
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        SONAR_HOST_URL: https://sonarcloud.io

@@ -1,0 +1,418 @@
+name: 'Build and Test dotnet projects'
+description: >-
+  Validates and applies the Liquibase changelog when there is one, builds and tests a .NET solution, then packs and uploads NuGet packages when a project is packable and
+  builds, smoke tests and uploads the production container image when the repository has a Dockerfile
+
+inputs:
+  version:
+    description: 'Version to build, pack and label the image with'
+    required: true
+  ref:
+    description: >-
+      Git ref or commit SHA to check out before building. Empty to use the repository already checked out
+      in the workspace.
+    required: false
+    default: ''
+  smoke-port:
+    description: 'Port the service listens on inside the container (ASPNETCORE_URLS); published on 3101 for the health check'
+    required: false
+    default: '3000'
+  smoke-env:
+    description: 'Extra environment for the smoke test, one KEY=VALUE per line'
+    required: false
+    default: ''
+  smoke-postgres:
+    description: >-
+      Start a PostgreSQL sidecar reachable as host "postgres" (database, user and password "smoke") for the
+      smoke test: auto starts it when a Liquibase changelog is detected; true or false forces it on or off
+    required: false
+    default: 'auto'
+  liquibase-changelog:
+    description: 'Path of the Liquibase changelog, relative to the repository root, used to detect Liquibase'
+    required: false
+    default: 'changelog/db.changelog.xml'
+  liquibase-version:
+    description: 'Liquibase release used to validate and apply the changelog'
+    required: false
+    default: '5.0.1'
+  liquibase-database:
+    description: 'Name of the throwaway PostgreSQL database the changelog is applied to'
+    required: false
+    default: 'dbname'
+
+outputs:
+  has-dockerfile:
+    description: 'Whether the repository has a Dockerfile, and so whether the image was built and tested'
+    value: ${{ steps.detect-docker.outputs.has-dockerfile }}
+  has-liquibase:
+    description: 'Whether the repository has a Liquibase changelog at the liquibase-changelog path'
+    value: ${{ steps.detect-liquibase.outputs.has-liquibase }}
+  migrations-artifact:
+    description: 'Name of the uploaded database migrations artifact; empty without a Liquibase changelog'
+    value: ${{ steps.package-migrations.outputs.artifact }}
+  migrations-artifact-url:
+    description: 'URL of the uploaded database migrations artifact; empty without a Liquibase changelog'
+    value: ${{ steps.upload-migrations.outputs.artifact-url }}
+  has-nuget:
+    description: 'Whether any project is packable, and so whether NuGet packages were produced'
+    value: ${{ steps.detect-nuget.outputs.has-nuget }}
+  image-ref:
+    description: 'Local tag of the tested container image; empty without a Dockerfile'
+    value: ${{ steps.image.outputs.ref }}
+  image-artifact:
+    description: 'Name of the uploaded container image artifact; empty without a Dockerfile'
+    value: ${{ steps.image.outputs.artifact }}
+  nuget-artifact-url:
+    description: 'URL of the uploaded NuGet packages artifact; empty without packable projects'
+    value: ${{ steps.upload-nuget.outputs.artifact-url }}
+  has-openapi:
+    description: 'Whether any project generated OpenAPI documents at build time (Microsoft.Extensions.ApiDescription.Server)'
+    value: ${{ steps.openapi.outputs.has-openapi }}
+  openapi-artifact:
+    description: 'Name of the uploaded OpenAPI documents zip artifact (openapi-<version>.zip); empty without OpenAPI documents'
+    value: ${{ steps.zip-openapi.outputs.artifact }}
+  openapi-artifact-url:
+    description: 'URL of the uploaded OpenAPI documents zip artifact; empty without OpenAPI documents'
+    value: ${{ steps.upload-openapi.outputs.artifact-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      if: ${{ inputs.ref != '' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.ref }}
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+      with:
+        global-json-file: global.json
+
+    - name: Check for Dockerfile
+      id: detect-docker
+      shell: bash
+      run: |
+        if [[ -f Dockerfile ]]; then
+          echo "has-dockerfile=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-dockerfile=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Check for Liquibase changelog
+      id: detect-liquibase
+      env:
+        LIQUIBASE_CHANGELOG: ${{ inputs.liquibase-changelog }}
+      shell: bash
+      run: |
+        if [[ -f "$LIQUIBASE_CHANGELOG" ]]; then
+          echo "has-liquibase=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-liquibase=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Check for NuGet projects
+      id: detect-nuget
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/detect-nuget.sh"'
+
+    # Liquibase changelog
+
+    - name: Set up JDK 17 for Liquibase
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+      with:
+        java-version: 17
+        distribution: 'zulu'
+
+    - name: Cache Liquibase
+      id: cache-liquibase
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/liquibase
+        key: ${{ runner.os }}-liquibase-${{ inputs.liquibase-version }}-postgresql
+
+    # Installed outside the workspace so it stays out of the Docker build context.
+    - name: Install Liquibase and the PostgreSQL driver
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' && steps.cache-liquibase.outputs.cache-hit != 'true' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        LIQUIBASE_VERSION: ${{ inputs.liquibase-version }}
+        LIQUIBASE_HOME: ${{ runner.temp }}/liquibase
+      shell: bash
+      run: |
+        archive="liquibase-$LIQUIBASE_VERSION.tar.gz"
+        download="$RUNNER_TEMP/$archive"
+        curl --fail --silent --show-error --location --output "$download" \
+          "https://github.com/liquibase/liquibase/releases/download/v$LIQUIBASE_VERSION/$archive"
+
+        # Check the download against the digest GitHub records for the release asset.
+        digest=$(gh api "repos/liquibase/liquibase/releases/tags/v$LIQUIBASE_VERSION" \
+          --jq ".assets[] | select(.name == \"$archive\") | .digest")
+        if [[ "$digest" != sha256:* ]]; then
+          echo "No SHA-256 digest is published for $archive." >&2
+          exit 1
+        fi
+        echo "${digest#sha256:}  $download" | sha256sum --check --strict
+
+        mkdir -p "$LIQUIBASE_HOME"
+        tar -xzf "$download" -C "$LIQUIBASE_HOME"
+        rm "$download"
+        "$LIQUIBASE_HOME/liquibase" lpm add postgresql --global
+
+    - name: Validate and apply Liquibase changelog
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        LIQUIBASE_CHANGELOG: ${{ inputs.liquibase-changelog }}
+        LIQUIBASE_DATABASE: ${{ inputs.liquibase-database }}
+        LIQUIBASE_HOME: ${{ runner.temp }}/liquibase
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/liquibase-validate.sh"'
+
+    # Solution
+
+    - name: Build solution
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: dotnet build --configuration Release -p:Version="$PACKAGE_VERSION"
+
+    - name: Run solution tests
+      shell: bash
+      run: dotnet test --configuration Release --no-build
+
+    # OpenAPI documents: generated by the build, and collected only once the tests have passed. Detection runs
+    # after the build because the generator's MSBuild properties only exist once the project is restored.
+
+    - name: Collect OpenAPI documents
+      id: openapi
+      env:
+        OPENAPI_OUTPUT: ${{ runner.temp }}/openapi/documents
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/detect-openapi.sh"'
+
+    # Outside the workspace so it stays out of the Docker build context.
+    - name: Zip OpenAPI documents
+      id: zip-openapi
+      if: ${{ steps.openapi.outputs.has-openapi == 'true' }}
+      env:
+        OPENAPI_OUTPUT: ${{ runner.temp }}/openapi/documents
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        archive="$RUNNER_TEMP/openapi/openapi-$VERSION.zip"
+        (cd "$OPENAPI_OUTPUT" && zip -q -r -X "$archive" .)
+        echo "path=$archive" >> "$GITHUB_OUTPUT"
+        echo "artifact=$(basename "$archive")" >> "$GITHUB_OUTPUT"
+
+    # Uploaded as-is rather than zipped again; the artifact takes the zip's file name.
+    - name: Upload OpenAPI documents
+      id: upload-openapi
+      if: ${{ steps.openapi.outputs.has-openapi == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        path: ${{ steps.zip-openapi.outputs.path }}
+        archive: false
+        if-no-files-found: error
+
+    - name: Summarise OpenAPI documents
+      if: ${{ steps.openapi.outputs.has-openapi == 'true' }}
+      env:
+        ARCHIVE: ${{ steps.zip-openapi.outputs.path }}
+        ARTIFACT: ${{ steps.zip-openapi.outputs.artifact }}
+        ARTIFACT_URL: ${{ steps.upload-openapi.outputs.artifact-url }}
+      shell: bash
+      run: |
+        {
+          printf '### OpenAPI documents\n\n```text\n'
+          zipinfo -1 "$ARCHIVE" | grep -v '/$'
+          printf 'Artifact: %s\n```\n\n' "$ARTIFACT"
+          printf '[Download workflow artifact](%s)\n' "$ARTIFACT_URL"
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # Database migrations: composite steps stop at the first failure, so these only run once the
+    # changelog has validated and applied and the solution has built and passed its tests.
+
+    - name: Package database migrations
+      id: package-migrations
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        LIQUIBASE_CHANGELOG: ${{ inputs.liquibase-changelog }}
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        migrations_path=$(dirname "$LIQUIBASE_CHANGELOG")
+        # Outside the workspace so it stays out of the Docker build context.
+        output="$RUNNER_TEMP/database-migrations"
+        mkdir -p "$output"
+        tar -czf "$output/migrations.tgz" "$migrations_path"
+
+        sha256=$(sha256sum "$output/migrations.tgz" | awk '{print $1}')
+        changeset_files=$(find "$migrations_path" -type f -printf '%P\n' | jq -R . | jq -s .)
+
+        jq -n \
+          --argjson files "$changeset_files" \
+          --arg version "$VERSION" \
+          --arg sha256 "$sha256" \
+          --arg date "$(date -Is)" \
+          --arg commit "$(git rev-parse HEAD)" \
+          --arg path "$migrations_path" \
+          --arg format "db-migration-metadata:1.0.0" \
+          '{format: $format, files: $files, version: $version, sha256: $sha256, date: $date, path: $path, commit: $commit}' \
+          > "$output/migrations.metadata.json"
+
+        echo "path=$output" >> "$GITHUB_OUTPUT"
+        echo "artifact=database-migrations-$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Upload database migrations
+      id: upload-migrations
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.package-migrations.outputs.artifact }}
+        path: ${{ steps.package-migrations.outputs.path }}
+        if-no-files-found: error
+
+    - name: Summarise database migrations
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        METADATA: ${{ steps.package-migrations.outputs.path }}/migrations.metadata.json
+        ARTIFACT: ${{ steps.package-migrations.outputs.artifact }}
+        ARTIFACT_URL: ${{ steps.upload-migrations.outputs.artifact-url }}
+      shell: bash
+      run: |
+        {
+          printf '### Database migrations\n\n```text\n'
+          jq -r '"Version: \(.version)\nCommit: \(.commit)\nPath: \(.path)\nSHA-256: \(.sha256)\nFiles:\n" + (.files | map("  " + .) | join("\n"))' "$METADATA"
+          printf 'Artifact: %s\n```\n\n' "$ARTIFACT"
+          printf '[Download workflow artifact](%s)\n\n' "$ARTIFACT_URL"
+          # Packaged on every build with a changelog, changed or not: this build cannot compare with main.
+          printf 'The changelog was validated and applied to a throwaway PostgreSQL database, and is packaged on '
+          printf "every build that has one, whether or not it changed. \`actions/publish-liquibase\` always publishes "
+          printf "it for a stable version, and for a prerelease only when \`%s\` differs from \`main\`.\n" \
+            "$(jq -r '.path' "$METADATA")"
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # NuGet packages
+
+    - name: Pack NuGet packages
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: >-
+        dotnet pack --configuration Release --no-build
+        -p:Version="$PACKAGE_VERSION"
+        --output artifacts/nuget
+
+    - name: Record package provenance
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        packages=(artifacts/nuget/*.nupkg)
+        if [[ ! -f "${packages[0]}" ]]; then
+          echo 'No NuGet packages were produced.' >&2
+          exit 1
+        fi
+        jq -n \
+          --arg commit "$(git rev-parse HEAD)" \
+          --arg version "$PACKAGE_VERSION" \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+          '{commit: $commit, version: $version, run_id: $run_id, run_attempt: $run_attempt}' \
+          > artifacts/nuget/provenance.json
+
+    - name: Upload NuGet packages
+      id: upload-nuget
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: nuget-packages-${{ inputs.version }}
+        path: |
+          artifacts/nuget/*.nupkg
+          artifacts/nuget/*.snupkg
+          artifacts/nuget/provenance.json
+        if-no-files-found: error
+
+    - name: Summarise NuGet packages
+      if: ${{ steps.detect-nuget.outputs.has-nuget == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+        SOURCE_REF: ${{ inputs.ref }}
+        ARTIFACT_URL: ${{ steps.upload-nuget.outputs.artifact-url }}
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/summarise-nuget.py" | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # Container image
+
+    - name: Set up Docker Buildx
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Prepare image metadata
+      id: image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE_NAME: ${{ github.event.repository.name }}
+      shell: bash
+      run: |
+        # Name the image after the commit checked out, so it matches what container-publish looks up.
+        revision=$(git rev-parse HEAD)
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+        echo "ref=$IMAGE_NAME:build-$revision" >> "$GITHUB_OUTPUT"
+        echo "artifact=container-image-$revision" >> "$GITHUB_OUTPUT"
+
+    - name: Build docker image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        target: production
+        no-cache: true
+        provenance: false
+        sbom: false
+        load: true
+        tags: |
+          ${{ steps.image.outputs.ref }}
+        labels: |
+          defra.cdp.git.repo.url=https://github.com/DEFRA/${{ github.event.repository.name }}
+          defra.cdp.git.repo.name=${{ github.event.repository.name }}
+          defra.cdp.service.name=${{ github.event.repository.name }}
+          defra.cdp.build.run_id=${{ github.run_id }}
+          defra.cdp.run_mode=service
+          git.hash=${{ steps.image.outputs.revision }}
+          org.opencontainers.image.version=${{ inputs.version }}
+
+    - name: Smoke test production image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE: ${{ steps.image.outputs.ref }}
+        PORT: ${{ inputs.smoke-port }}
+        SMOKE_ENV: ${{ inputs.smoke-env }}
+        SMOKE_POSTGRES: ${{ inputs.smoke-postgres }}
+        HAS_LIQUIBASE: ${{ steps.detect-liquibase.outputs.has-liquibase }}
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/smoke-test.sh"'
+
+    - name: Export tested image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE: ${{ steps.image.outputs.ref }}
+      shell: bash
+      run: |
+        mkdir container-artifact
+        docker image inspect "$IMAGE" --format '{{.Id}}' > container-artifact/image-id.txt
+        printf '%s\n' "$IMAGE" > container-artifact/image-ref.txt
+        docker save --output container-artifact/image.tar "$IMAGE"
+
+    - name: Upload tested image artifact
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.image.outputs.artifact }}
+        path: container-artifact
+        if-no-files-found: error
+        compression-level: 0

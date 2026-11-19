@@ -1,0 +1,46 @@
+name: 'Calculate Version'
+description: 'Calculates the SemVer version from the latest stable tag and the branch name'
+
+inputs:
+  ref:
+    description: >-
+      Git ref to check out, with all history and tags, before calculating the version. Empty to use
+      the repository already checked out in the workspace (its tags are fetched).
+    required: false
+    default: ''
+  branch:
+    description: 'Feature, hotfix or Dependabot branch used to determine the version bump'
+    required: true
+  release-type:
+    description: 'Either prerelease or stable'
+    required: false
+    default: 'prerelease'
+
+outputs:
+  version:
+    description: 'The calculated semantic version'
+    value: ${{ steps.calculate_version.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout code and all tags
+      if: ${{ inputs.ref != '' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Fetch tags
+      if: ${{ inputs.ref == '' }}
+      shell: bash
+      run: git fetch --force --tags --quiet origin
+
+    - name: Calculate version from the latest stable tag
+      id: calculate_version
+      env:
+        VERSION_BRANCH: ${{ inputs.branch }}
+        RELEASE_TYPE: ${{ inputs.release-type }}
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/calculate-version.sh"'

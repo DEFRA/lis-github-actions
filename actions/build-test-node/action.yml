@@ -1,0 +1,243 @@
+name: 'Build and Test Node.js projects'
+description: >-
+  Installs, builds and tests a Node.js project, then packs and uploads the npm package when package.json is not private and
+  builds, smoke tests and uploads the production container image when the repository has a Dockerfile
+
+inputs:
+  version:
+    description: 'Version to build, pack and label the image with; written to package.json before the build'
+    required: true
+  ref:
+    description: >-
+      Git ref or commit SHA to check out before building. Empty to use the repository already checked out
+      in the workspace.
+    required: false
+    default: ''
+  image-target:
+    description: 'Dockerfile stage to build'
+    required: false
+    default: 'production'
+  smoke-port:
+    description: 'Port the service listens on inside the container (PORT); published on the same host port for the health check'
+    required: false
+    default: '3000'
+  health-path:
+    description: 'Path polled until it returns 2xx'
+    required: false
+    default: '/health'
+  smoke-env:
+    description: 'Extra environment for the smoke test, one KEY=VALUE per line'
+    required: false
+    default: ''
+  smoke-postgres:
+    description: >-
+      Start a PostgreSQL sidecar reachable as host "postgres" (database, user and password "smoke") for the
+      smoke test: true or false
+    required: false
+    default: 'false'
+
+outputs:
+  has-dockerfile:
+    description: 'Whether the repository has the Dockerfile, and so whether the image was built and tested'
+    value: ${{ steps.detect-docker.outputs.has-dockerfile }}
+  has-npm-package:
+    description: 'Whether package.json is publishable (not "private": true), and so whether an npm package was produced'
+    value: ${{ steps.detect-npm.outputs.has-npm-package }}
+  image-ref:
+    description: 'Local tag of the tested container image; empty without a Dockerfile'
+    value: ${{ steps.image.outputs.ref }}
+  image-artifact:
+    description: 'Name of the uploaded container image artifact; empty without a Dockerfile'
+    value: ${{ steps.image.outputs.artifact }}
+  npm-artifact-url:
+    description: 'URL of the uploaded npm package artifact; empty when package.json is private'
+    value: ${{ steps.upload-npm.outputs.artifact-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      if: ${{ inputs.ref != '' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.ref }}
+
+    - name: Setup Node
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+
+    - name: Check for Dockerfile
+      id: detect-docker
+      shell: bash
+      run: |
+        if [[ -f Dockerfile ]]; then
+          echo "has-dockerfile=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-dockerfile=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Check for a publishable npm package
+      id: detect-npm
+      shell: bash
+      run: |
+        if jq -e '.private == true' package.json > /dev/null; then
+          echo "has-npm-package=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Publishable package: $(jq -r '.name' package.json)"
+          echo "has-npm-package=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Project
+
+    # --ignore-scripts so the preversion, version and postversion scripts do not run; the lockfile's
+    # root version is updated too, so npm ci still matches.
+    - name: Set package version
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: npm version "$PACKAGE_VERSION" --no-git-tag-version --allow-same-version --ignore-scripts
+
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+
+    - name: Audits dependencies
+      shell: bash
+      run: npm run security-audit
+
+    - name: Checks formatting
+      shell: bash
+      run: npm run format:check
+
+    - name: Runs JavaScript linting
+      shell: bash
+      run: npm run lint --if-present
+
+    - name: Run tests
+      shell: bash
+      run: npm run test
+
+    # npm package
+    - name: Pack npm package
+      id: pack-npm
+      if: ${{ steps.detect-npm.outputs.has-npm-package == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        mkdir -p artifacts/npm
+        npm pack --pack-destination artifacts/npm
+
+        packages=(artifacts/npm/*.tgz)
+        if [[ ! -f "${packages[0]}" ]]; then
+          echo 'No npm package was produced.' >&2
+          exit 1
+        fi
+        jq -n \
+          --arg commit "$(git rev-parse HEAD)" \
+          --arg version "$PACKAGE_VERSION" \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+          '{commit: $commit, version: $version, run_id: $run_id, run_attempt: $run_attempt}' \
+          > artifacts/npm/provenance.json
+
+    - name: Upload npm package
+      id: upload-npm
+      if: ${{ steps.detect-npm.outputs.has-npm-package == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: npm-packages-${{ inputs.version }}
+        path: |
+          artifacts/npm/*.tgz
+          artifacts/npm/provenance.json
+        if-no-files-found: error
+
+    - name: Summarise npm package
+      if: ${{ steps.detect-npm.outputs.has-npm-package == 'true' }}
+      env:
+        PACKAGE_VERSION: ${{ inputs.version }}
+        SOURCE_REF: ${{ inputs.ref }}
+        ARTIFACT: ${{ steps.pack-npm.outputs.artifact }}
+        ARTIFACT_URL: ${{ steps.upload-npm.outputs.artifact-url }}
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/summarise-npm.py" | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # Container image
+
+    - name: Set up Docker Buildx
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Prepare image metadata
+      id: image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE_NAME: ${{ github.event.repository.name }}
+      shell: bash
+      run: |
+        # Name the image after the commit checked out, so it matches what container-publish looks up.
+        revision=$(git rev-parse HEAD)
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+        echo "ref=$IMAGE_NAME:build-$revision" >> "$GITHUB_OUTPUT"
+        echo "artifact=container-image-$revision" >> "$GITHUB_OUTPUT"
+
+    - name: Build docker image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        file: ${{ inputs.dockerfile }}
+        target: ${{ inputs.image-target }}
+        # Layer cache in the Actions cache: the dependency layer hits whenever the lockfile is
+        # unchanged. pull keeps the pinned base image fresh. A release runs on pull_request closed,
+        # whose merge ref GitHub purges from the cache as the PR closes, so that run cannot read or
+        # reserve entries: skip the export there, and never fail a build on a cache write elsewhere.
+        pull: true
+        cache-from: type=gha
+        cache-to: ${{ github.event.action != 'closed' && 'type=gha,mode=max,ignore-error=true' || '' }}
+        provenance: false
+        sbom: false
+        load: true
+        tags: |
+          ${{ steps.image.outputs.ref }}
+        labels: |
+          defra.cdp.git.repo.url=https://github.com/DEFRA/${{ github.event.repository.name }}
+          defra.cdp.git.repo.name=${{ github.event.repository.name }}
+          defra.cdp.service.name=${{ github.event.repository.name }}
+          defra.cdp.build.run_id=${{ github.run_id }}
+          defra.cdp.run_mode=service
+          git.hash=${{ steps.image.outputs.revision }}
+          org.opencontainers.image.version=${{ inputs.version }}
+
+    - name: Smoke test production image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE: ${{ steps.image.outputs.ref }}
+        PORT: ${{ inputs.smoke-port }}
+        HEALTH_PATH: ${{ inputs.health-path }}
+        SMOKE_ENV: ${{ inputs.smoke-env }}
+        SMOKE_POSTGRES: ${{ inputs.smoke-postgres }}
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/smoke-test.sh"'
+
+    - name: Export tested image
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      env:
+        IMAGE: ${{ steps.image.outputs.ref }}
+      shell: bash
+      run: |
+        mkdir container-artifact
+        docker image inspect "$IMAGE" --format '{{.Id}}' > container-artifact/image-id.txt
+        printf '%s\n' "$IMAGE" > container-artifact/image-ref.txt
+        docker save --output container-artifact/image.tar "$IMAGE"
+
+    - name: Upload tested image artifact
+      if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.image.outputs.artifact }}
+        path: container-artifact
+        if-no-files-found: error
+        compression-level: 0

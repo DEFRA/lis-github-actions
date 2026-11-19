@@ -1,0 +1,49 @@
+name: 'Create Git Tag'
+description: >-
+  Tags a commit with the version and pushes the tag using the LIS release GitHub App, so the push
+  triggers the repository's tag workflows. Checks out the commit, replacing the workspace's checkout.
+
+inputs:
+  version:
+    description: 'Version to tag the commit with'
+    required: true
+  ref:
+    description: 'Exact ref or commit SHA to tag'
+    required: true
+  app-client-id:
+    description: 'Client ID of the LIS release GitHub App, normally vars.LIS_RELEASE_APP_CLIENT_ID'
+    required: true
+  app-private-key:
+    description: 'Private key of the LIS release GitHub App, normally secrets.LIS_RELEASE_APP_PRIVATE_KEY'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Create GitHub App token
+      id: app-token
+      uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        permission-contents: write
+
+    # Check out with the app token: a tag pushed with github.token would not trigger other workflows.
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+        fetch-tags: true
+        token: ${{ steps.app-token.outputs.token }}
+
+    - name: Create and push tag
+      env:
+        TAG: ${{ inputs.version }}
+      shell: bash
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        git tag -a "$TAG" -m "Release $TAG"
+        git push origin "refs/tags/$TAG"
