@@ -179,7 +179,7 @@ runs:
 
     - name: Log in to Docker Hub
       if: ${{ inputs.push-docker-hub == 'true' && !contains(inputs.version, '-') }}
-      uses: DEFRA/cdp-build-action/docker-login@5e3632e25c7d4c3d514da45acaa149fd4c193640 # main
+      uses: DEFRA/cdp-build-action/docker-login@54ced5c5344c8b9620561a1628fe8f3d858e9871 # v1.5.0
       with:
         iam-role-name: github-${{ inputs.image-name }}-build-role
         aws-account-id: ${{ inputs.aws-account-id }}
