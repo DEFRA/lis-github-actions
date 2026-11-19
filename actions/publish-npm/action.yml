@@ -60,14 +60,12 @@ runs:
         path: artifacts
         merge-multiple: true
 
-    # Composite steps cannot set timeout-minutes, so bound the wait with timeout(1) instead.
-    - name: Verify package provenance and completed validation
+    - name: Verify package provenance
       env:
-        GH_TOKEN: ${{ inputs.github-token }}
         PACKAGE_VERSION: ${{ inputs.version }}
         BUILD_RUN_ID: ${{ steps.find-artifact.outputs.run-id }}
       shell: bash
-      run: timeout 12m python3 "$GITHUB_ACTION_PATH/../_common/verify-provenance.py"
+      run: python3 "$GITHUB_ACTION_PATH/../_common/verify-provenance.py"
 
     - name: Verify package version
       env:

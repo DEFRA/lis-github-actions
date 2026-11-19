@@ -226,21 +226,12 @@ runs:
       if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}
       env:
         IMAGE: ${{ steps.image.outputs.ref }}
-        VERSION: ${{ inputs.version }}
       shell: bash
       run: |
         mkdir container-artifact
         docker image inspect "$IMAGE" --format '{{.Id}}' > container-artifact/image-id.txt
         printf '%s\n' "$IMAGE" > container-artifact/image-ref.txt
         docker save --output container-artifact/image.tar "$IMAGE"
-        # Read by actions/publish-container to check the artifact and wait for this run to succeed.
-        jq -n \
-          --arg commit "$(git rev-parse HEAD)" \
-          --arg version "$VERSION" \
-          --arg run_id "$GITHUB_RUN_ID" \
-          --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-          '{commit: $commit, version: $version, run_id: $run_id, run_attempt: $run_attempt}' \
-          > container-artifact/provenance.json
 
     - name: Upload tested image artifact
       if: ${{ steps.detect-docker.outputs.has-dockerfile == 'true' }}

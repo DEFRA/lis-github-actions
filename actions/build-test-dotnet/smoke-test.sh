@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # Runs IMAGE with ASPNETCORE_URLS on PORT (published on 3101) and waits for /health to answer.
-# SMOKE_ENV adds one KEY=VALUE per line; SMOKE_POSTGRES=true starts a PostgreSQL sidecar
-# reachable as host "postgres" with database, user and password "smoke".
+# SMOKE_ENV adds one KEY=VALUE per line. SMOKE_POSTGRES=true starts a PostgreSQL sidecar
+# reachable as host "postgres" with database, user and password "smoke"; SMOKE_POSTGRES=auto
+# starts it when HAS_LIQUIBASE=true.
 set -euo pipefail
+
+case "$SMOKE_POSTGRES" in
+  auto) start_postgres="${HAS_LIQUIBASE:-false}" ;;
+  true|false) start_postgres="$SMOKE_POSTGRES" ;;
+  *) echo "smoke-postgres must be auto, true or false, not '$SMOKE_POSTGRES'" >&2; exit 1 ;;
+esac
+echo "Start PostgreSQL sidecar: $start_postgres (smoke-postgres: $SMOKE_POSTGRES)"
 
 network="$(uuidgen)"
 database=''
@@ -24,7 +32,7 @@ trap cleanup EXIT
 
 docker network create "$network"
 
-if [[ "$SMOKE_POSTGRES" == 'true' ]]; then
+if [[ "$start_postgres" == 'true' ]]; then
   database=$(docker run \
     --detach \
     --network "$network" \

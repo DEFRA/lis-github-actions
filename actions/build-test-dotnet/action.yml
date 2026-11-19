@@ -1,6 +1,6 @@
 name: 'Build and Test dotnet projects'
 description: >-
-  Builds and tests a .NET solution, then packs and uploads NuGet packages when a project is packable and
+  Validates and applies the Liquibase changelog when there is one, builds and tests a .NET solution, then packs and uploads NuGet packages when a project is packable and
   builds, smoke tests and uploads the production container image when the repository has a Dockerfile
 
 inputs:
@@ -22,14 +22,37 @@ inputs:
     required: false
     default: ''
   smoke-postgres:
-    description: 'Start a PostgreSQL sidecar reachable as host "postgres" (database, user and password "smoke"); true or false'
+    description: >-
+      Start a PostgreSQL sidecar reachable as host "postgres" (database, user and password "smoke") for the
+      smoke test: auto starts it when a Liquibase changelog is detected; true or false forces it on or off
     required: false
-    default: 'false'
+    default: 'auto'
+  liquibase-changelog:
+    description: 'Path of the Liquibase changelog, relative to the repository root, used to detect Liquibase'
+    required: false
+    default: 'changelog/db.changelog.xml'
+  liquibase-version:
+    description: 'Liquibase release used to validate and apply the changelog'
+    required: false
+    default: '5.0.1'
+  liquibase-database:
+    description: 'Name of the throwaway PostgreSQL database the changelog is applied to'
+    required: false
+    default: 'dbname'
 
 outputs:
   has-dockerfile:
     description: 'Whether the repository has a Dockerfile, and so whether the image was built and tested'
     value: ${{ steps.detect-docker.outputs.has-dockerfile }}
+  has-liquibase:
+    description: 'Whether the repository has a Liquibase changelog at the liquibase-changelog path'
+    value: ${{ steps.detect-liquibase.outputs.has-liquibase }}
+  migrations-artifact:
+    description: 'Name of the uploaded database migrations artifact; empty without a Liquibase changelog'
+    value: ${{ steps.package-migrations.outputs.artifact }}
+  migrations-artifact-url:
+    description: 'URL of the uploaded database migrations artifact; empty without a Liquibase changelog'
+    value: ${{ steps.upload-migrations.outputs.artifact-url }}
   has-nuget:
     description: 'Whether any project is packable, and so whether NuGet packages were produced'
     value: ${{ steps.detect-nuget.outputs.has-nuget }}
@@ -67,10 +90,78 @@ runs:
           echo "has-dockerfile=false" >> "$GITHUB_OUTPUT"
         fi
 
+    - name: Check for Liquibase changelog
+      id: detect-liquibase
+      env:
+        LIQUIBASE_CHANGELOG: ${{ inputs.liquibase-changelog }}
+      shell: bash
+      run: |
+        if [[ -f "$LIQUIBASE_CHANGELOG" ]]; then
+          echo "has-liquibase=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-liquibase=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Check for NuGet projects
       id: detect-nuget
       shell: bash
       run: '"$GITHUB_ACTION_PATH/detect-nuget.sh"'
+
+    # Liquibase changelog
+
+    - name: Set up JDK 17 for Liquibase
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+      with:
+        java-version: 17
+        distribution: 'zulu'
+
+    - name: Cache Liquibase
+      id: cache-liquibase
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/liquibase
+        key: ${{ runner.os }}-liquibase-${{ inputs.liquibase-version }}-postgresql
+
+    # Installed outside the workspace so it stays out of the Docker build context.
+    - name: Install Liquibase and the PostgreSQL driver
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' && steps.cache-liquibase.outputs.cache-hit != 'true' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        LIQUIBASE_VERSION: ${{ inputs.liquibase-version }}
+        LIQUIBASE_HOME: ${{ runner.temp }}/liquibase
+      shell: bash
+      run: |
+        archive="liquibase-$LIQUIBASE_VERSION.tar.gz"
+        download="$RUNNER_TEMP/$archive"
+        curl --fail --silent --show-error --location --output "$download" \
+          "https://github.com/liquibase/liquibase/releases/download/v$LIQUIBASE_VERSION/$archive"
+
+        # Check the download against the digest GitHub records for the release asset.
+        digest=$(gh api "repos/liquibase/liquibase/releases/tags/v$LIQUIBASE_VERSION" \
+          --jq ".assets[] | select(.name == \"$archive\") | .digest")
+        if [[ "$digest" != sha256:* ]]; then
+          echo "No SHA-256 digest is published for $archive." >&2
+          exit 1
+        fi
+        echo "${digest#sha256:}  $download" | sha256sum --check --strict
+
+        mkdir -p "$LIQUIBASE_HOME"
+        tar -xzf "$download" -C "$LIQUIBASE_HOME"
+        rm "$download"
+        "$LIQUIBASE_HOME/liquibase" lpm add postgresql --global
+
+    - name: Validate and apply Liquibase changelog
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        LIQUIBASE_CHANGELOG: ${{ inputs.liquibase-changelog }}
+        LIQUIBASE_DATABASE: ${{ inputs.liquibase-database }}
+        LIQUIBASE_HOME: ${{ runner.temp }}/liquibase
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/liquibase-validate.sh"'
+
+    # Solution
 
     - name: Build solution
       env:
@@ -81,6 +172,64 @@ runs:
     - name: Run solution tests
       shell: bash
       run: dotnet test --configuration Release --no-build
+
+    # Database migrations: composite steps stop at the first failure, so these only run once the
+    # changelog has validated and applied and the solution has built and passed its tests.
+
+    - name: Package database migrations
+      id: package-migrations
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        LIQUIBASE_CHANGELOG: ${{ inputs.liquibase-changelog }}
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        migrations_path=$(dirname "$LIQUIBASE_CHANGELOG")
+        # Outside the workspace so it stays out of the Docker build context.
+        output="$RUNNER_TEMP/database-migrations"
+        mkdir -p "$output"
+        tar -czf "$output/migrations.tgz" "$migrations_path"
+
+        sha256=$(sha256sum "$output/migrations.tgz" | awk '{print $1}')
+        changeset_files=$(find "$migrations_path" -type f -printf '%P\n' | jq -R . | jq -s .)
+
+        jq -n \
+          --argjson files "$changeset_files" \
+          --arg version "$VERSION" \
+          --arg sha256 "$sha256" \
+          --arg date "$(date -Is)" \
+          --arg commit "$(git rev-parse HEAD)" \
+          --arg path "$migrations_path" \
+          --arg format "db-migration-metadata:1.0.0" \
+          '{format: $format, files: $files, version: $version, sha256: $sha256, date: $date, path: $path, commit: $commit}' \
+          > "$output/migrations.metadata.json"
+
+        echo "path=$output" >> "$GITHUB_OUTPUT"
+        echo "artifact=database-migrations-$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Upload database migrations
+      id: upload-migrations
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.package-migrations.outputs.artifact }}
+        path: ${{ steps.package-migrations.outputs.path }}
+        if-no-files-found: error
+
+    - name: Summarise database migrations
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        METADATA: ${{ steps.package-migrations.outputs.path }}/migrations.metadata.json
+        ARTIFACT: ${{ steps.package-migrations.outputs.artifact }}
+        ARTIFACT_URL: ${{ steps.upload-migrations.outputs.artifact-url }}
+      shell: bash
+      run: |
+        {
+          printf '### Database migrations\n\n```text\n'
+          jq -r '"Version: \(.version)\nCommit: \(.commit)\nPath: \(.path)\nSHA-256: \(.sha256)\nFiles:\n" + (.files | map("  " + .) | join("\n"))' "$METADATA"
+          printf 'Artifact: %s\n```\n\n' "$ARTIFACT"
+          printf '[Download workflow artifact](%s)\n' "$ARTIFACT_URL"
+        } | tee -a "$GITHUB_STEP_SUMMARY"
 
     # NuGet packages
 
@@ -181,6 +330,7 @@ runs:
         PORT: ${{ inputs.smoke-port }}
         SMOKE_ENV: ${{ inputs.smoke-env }}
         SMOKE_POSTGRES: ${{ inputs.smoke-postgres }}
+        HAS_LIQUIBASE: ${{ steps.detect-liquibase.outputs.has-liquibase }}
       shell: bash
       run: '"$GITHUB_ACTION_PATH/smoke-test.sh"'
 
