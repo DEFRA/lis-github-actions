@@ -1,0 +1,204 @@
+name: 'Publish Liquibase'
+description: >-
+  Publishes the database migrations that a successful prerelease or release run validated, applied and
+  packaged for the version to the CDP database migrations S3 bucket. Stable versions are always published;
+  prereleases only when the migrations differ from main. Does nothing when the tagged commit has no
+  Liquibase changelog. Checks out the version tag, replacing the workspace's checkout.
+
+inputs:
+  version:
+    description: 'Version tag identifying the database-migrations-<version> artifact to publish'
+    required: true
+  aws-account-id:
+    description: 'AWS account that holds the build role, normally secrets.LIS_AWS_ACCOUNT_ID'
+    required: true
+  aws-region:
+    description: 'AWS region of the build role'
+    required: false
+    default: 'eu-west-2'
+  service-name:
+    description: 'Service the migrations belong to; the S3 prefix, and names the github-<service-name>-build-role IAM role'
+    required: false
+    default: ${{ github.event.repository.name }}
+  liquibase-changelog:
+    description: >-
+      Path of the Liquibase changelog, relative to the repository root, as passed to build-test-dotnet. Without
+      one at the tagged commit there is nothing to publish
+    required: false
+    default: 'changelog/db.changelog.xml'
+  bucket:
+    description: 'S3 bucket the migrations are published to, under <service-name>/<version>/'
+    required: false
+    default: 'cdp-management-database-migrations'
+  github-token:
+    description: 'Token used to find and download the migrations artifact; needs actions: read'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  build-run-id:
+    description: 'ID of the workflow run that validated and packaged the migrations'
+    value: ${{ steps.find-artifact.outputs.run-id }}
+  has-liquibase:
+    description: 'Whether the tagged commit has a Liquibase changelog at the liquibase-changelog path'
+    value: ${{ steps.detect-liquibase.outputs.has-liquibase }}
+  published:
+    description: >-
+      Whether the migrations were published; false without a Liquibase changelog, or for a prerelease whose
+      migrations match main
+    value: ${{ steps.changes.outputs.changed == 'true' }}
+  s3-uri:
+    description: 'S3 prefix the migrations were published to; empty when they were not published'
+    value: ${{ steps.upload.outputs.destination }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate publication configuration
+      env:
+        AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+        AWS_REGION: ${{ inputs.aws-region }}
+        SERVICE_NAME: ${{ inputs.service-name }}
+        BUCKET: ${{ inputs.bucket }}
+      shell: bash
+      run: |
+        missing=()
+        [[ -n "$AWS_ACCOUNT_ID" ]] || missing+=(aws-account-id)
+        [[ -n "$AWS_REGION" ]] || missing+=(aws-region)
+        [[ -n "$SERVICE_NAME" ]] || missing+=(service-name)
+        [[ -n "$BUCKET" ]] || missing+=(bucket)
+        if [[ ${#missing[@]} -gt 0 ]]; then
+          echo "Missing required inputs: ${missing[*]}" >&2
+          exit 1
+        fi
+
+    # All history, so a prerelease can be compared with main.
+    - name: Checkout version tag
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: refs/tags/${{ inputs.version }}
+        fetch-depth: 0
+        fetch-tags: true
+        persist-credentials: false
+
+    # build-test-dotnet uploads database-migrations-<version> for every build of a repository with a
+    # changelog, changed or not, and never without one. So no changelog means nothing to publish, while a
+    # changelog without an artifact is an error.
+    - name: Check for Liquibase changelog
+      id: detect-liquibase
+      env:
+        LIQUIBASE_CHANGELOG: ${{ inputs.liquibase-changelog }}
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        if [[ -f "$LIQUIBASE_CHANGELOG" ]]; then
+          echo "has-liquibase=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-liquibase=false" >> "$GITHUB_OUTPUT"
+          echo "No Liquibase changelog at \`$LIQUIBASE_CHANGELOG\` for \`$VERSION\`; no database migrations to publish." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Find migrations build artifact
+      id: find-artifact
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ARTIFACT_NAME: database-migrations-${{ inputs.version }}
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/../_common/find-artifact.py"
+
+    - name: Download migrations artifact
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        artifact-ids: ${{ steps.find-artifact.outputs.artifact-id }}
+        run-id: ${{ steps.find-artifact.outputs.run-id }}
+        github-token: ${{ inputs.github-token }}
+        path: artifacts
+        merge-multiple: true
+
+    # The metadata build-test-dotnet writes beside the archive records what it was built from.
+    - name: Verify migrations package
+      id: package
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        metadata=artifacts/migrations.metadata.json
+        archive=artifacts/migrations.tgz
+        for file in "$metadata" "$archive"; do
+          if [[ ! -f "$file" ]]; then
+            echo "$file is missing from the artifact. Rebuild the version before publishing." >&2
+            exit 1
+          fi
+        done
+
+        tagged_commit=$(git rev-parse HEAD)
+        jq -e --arg commit "$tagged_commit" --arg version "$VERSION" '
+          .format == "db-migration-metadata:1.0.0" and .commit == $commit and .version == $version
+        ' "$metadata" > /dev/null || {
+          echo "$metadata does not match commit '$tagged_commit' and version '$VERSION':" >&2
+          jq '{format, commit, version}' "$metadata" >&2
+          exit 1
+        }
+
+        expected_sha256=$(jq -r '.sha256' "$metadata")
+        actual_sha256=$(sha256sum "$archive" | awk '{print $1}')
+        if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+          echo "migrations.tgz SHA-256 '$actual_sha256' does not match the metadata '$expected_sha256'." >&2
+          exit 1
+        fi
+
+        echo "migrations-path=$(jq -r '.path' "$metadata")" >> "$GITHUB_OUTPUT"
+
+    # Stable releases always receive a versioned schema package. A prerelease is published only when its
+    # migrations differ from main.
+    - name: Check for database changes
+      id: changes
+      if: ${{ steps.detect-liquibase.outputs.has-liquibase == 'true' }}
+      env:
+        VERSION: ${{ inputs.version }}
+        MIGRATIONS_PATH: ${{ steps.package.outputs.migrations-path }}
+      shell: bash
+      run: |
+        if [[ "$VERSION" != *-* ]]; then
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        elif git diff --quiet origin/main...HEAD -- "$MIGRATIONS_PATH"; then
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "No database migration changes from main to publish for \`$VERSION\`." | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Configure AWS credentials
+      if: ${{ steps.changes.outputs.changed == 'true' }}
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        aws-region: ${{ inputs.aws-region }}
+        role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/github-${{ inputs.service-name }}-build-role
+
+    - name: Verify AWS identity
+      if: ${{ steps.changes.outputs.changed == 'true' }}
+      shell: bash
+      run: aws sts get-caller-identity
+
+    - name: Upload migrations to S3
+      id: upload
+      if: ${{ steps.changes.outputs.changed == 'true' }}
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        SERVICE_NAME: ${{ inputs.service-name }}
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        destination="s3://$BUCKET/$SERVICE_NAME/$VERSION"
+        aws s3 cp artifacts/migrations.tgz "$destination/migrations.tgz"
+        aws s3 cp artifacts/migrations.metadata.json "$destination/migrations.metadata.json"
+
+        echo "destination=$destination" >> "$GITHUB_OUTPUT"
+        {
+          printf '### Database migrations\n\n'
+          printf "Published database schema migration version \`%s\` to \`%s\`.\n" "$VERSION" "$destination"
+        } | tee -a "$GITHUB_STEP_SUMMARY"
