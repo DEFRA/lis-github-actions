@@ -15,7 +15,7 @@ fi
   /v:"$PROJECT_VERSION" \
   /d:sonar.token="$SONAR_TOKEN" \
   /d:sonar.host.url="https://sonarcloud.io" \
-  /d:sonar.cs.vscoveragexml.reportsPaths="coverage/**/coverage.xml" \
+  /d:sonar.cs.vscoveragexml.reportsPaths="coverage/coverage.xml" \
   /d:sonar.exclusions="$EXCLUSIONS" \
   "${branch_args[@]}"
 
