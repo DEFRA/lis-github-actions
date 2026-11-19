@@ -1,0 +1,218 @@
+name: 'Publish Container'
+description: >-
+  Publishes the container image that a successful prerelease or release run built and smoke tested for the
+  tagged commit to Amazon ECR and, for stable versions, Docker Hub. Checks out the version tag, replacing the
+  workspace's checkout.
+
+inputs:
+  version:
+    description: 'Version tag to publish; the image is found by the commit it points at'
+    required: true
+  aws-account-id:
+    description: 'AWS account that holds the ECR repository, normally secrets.LIS_AWS_ACCOUNT_ID'
+    required: true
+  aws-region:
+    description: 'AWS region of the ECR repository'
+    required: false
+    default: 'eu-west-2'
+  image-name:
+    description: 'ECR and Docker Hub repository name; also names the github-<image-name>-build-role IAM role'
+    required: false
+    default: ${{ github.event.repository.name }}
+  push-docker-hub:
+    description: 'Whether to also push stable versions to Docker Hub as defradigital/<image-name>'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Token used to find and download the image artifact; needs actions: read'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  build-run-id:
+    description: 'ID of the workflow run that built and tested the published image'
+    value: ${{ steps.find-artifact.outputs.run-id }}
+  ecr-image:
+    description: 'ECR image reference pushed for the version'
+    value: ${{ steps.push-ecr.outputs.image }}
+  is-latest:
+    description: 'Whether the version is the newest stable version, and so was also pushed as latest to Docker Hub'
+    value: ${{ steps.latest.outputs.is-latest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate publication configuration
+      env:
+        AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+        AWS_REGION: ${{ inputs.aws-region }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+      shell: bash
+      run: |
+        missing=()
+        [[ -n "$AWS_ACCOUNT_ID" ]] || missing+=(aws-account-id)
+        [[ -n "$AWS_REGION" ]] || missing+=(aws-region)
+        [[ -n "$IMAGE_NAME" ]] || missing+=(image-name)
+        if [[ ${#missing[@]} -gt 0 ]]; then
+          echo "Missing required inputs: ${missing[*]}" >&2
+          exit 1
+        fi
+
+    # All history and tags, to tell whether this is the newest stable version.
+    - name: Checkout version tag
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: refs/tags/${{ inputs.version }}
+        fetch-depth: 0
+        fetch-tags: true
+        persist-credentials: false
+
+    # build-test-dotnet and build-test-node name the image artifact after the commit they built.
+    - name: Find image build artifact
+      id: find-artifact
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      shell: bash
+      run: |
+        ARTIFACT_NAME="container-image-$(git rev-parse HEAD)" \
+          python3 "$GITHUB_ACTION_PATH/../_common/find-artifact.py"
+
+    - name: Download image artifact
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        artifact-ids: ${{ steps.find-artifact.outputs.artifact-id }}
+        run-id: ${{ steps.find-artifact.outputs.run-id }}
+        github-token: ${{ inputs.github-token }}
+        path: artifacts
+        merge-multiple: true
+
+    # Composite steps cannot set timeout-minutes, so bound the wait with timeout(1) instead.
+    - name: Verify image provenance and completed validation
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PACKAGE_VERSION: ${{ inputs.version }}
+        BUILD_RUN_ID: ${{ steps.find-artifact.outputs.run-id }}
+      shell: bash
+      run: timeout 12m python3 "$GITHUB_ACTION_PATH/../_common/verify-provenance.py"
+
+    - name: Load and verify tested image
+      id: image
+      env:
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        source_image=$(cat artifacts/image-ref.txt)
+        expected_id=$(cat artifacts/image-id.txt)
+        docker load --input artifacts/image.tar
+
+        actual_id=$(docker image inspect "$source_image" --format '{{.Id}}')
+        if [[ "$actual_id" != "$expected_id" ]]; then
+          echo "Loaded image ID '$actual_id' does not match the tested image '$expected_id'." >&2
+          exit 1
+        fi
+
+        tagged_commit=$(git rev-parse HEAD)
+        revision=$(docker image inspect "$source_image" --format '{{index .Config.Labels "git.hash"}}')
+        if [[ "$revision" != "$tagged_commit" ]]; then
+          echo "Image revision '$revision' does not match tagged commit '$tagged_commit'." >&2
+          exit 1
+        fi
+
+        image_version=$(docker image inspect "$source_image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
+        if [[ "$image_version" != "$VERSION" ]]; then
+          echo "Image version '$image_version' does not match tag '$VERSION'." >&2
+          exit 1
+        fi
+
+        echo "source=$source_image" >> "$GITHUB_OUTPUT"
+        echo "revision=$tagged_commit" >> "$GITHUB_OUTPUT"
+
+    - name: Check whether this is the newest stable version
+      id: latest
+      env:
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      run: |
+        newest=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+        if [[ "$VERSION" == "$newest" ]]; then
+          echo "is-latest=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "'$VERSION' is not the newest stable version ('$newest'); latest will not be moved."
+          echo "is-latest=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Amazon ECR
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        aws-region: ${{ inputs.aws-region }}
+        role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/github-${{ inputs.image-name }}-build-role
+
+    - name: Verify AWS identity
+      shell: bash
+      run: aws sts get-caller-identity
+
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+      with:
+        mask-password: 'true'
+
+    - name: Push image to Amazon ECR
+      id: push-ecr
+      env:
+        SOURCE_IMAGE: ${{ steps.image.outputs.source }}
+        REVISION: ${{ steps.image.outputs.revision }}
+        VERSION: ${{ inputs.version }}
+        AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+        AWS_REGION: ${{ inputs.aws-region }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+      shell: bash
+      run: |
+        registry="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+        version_image="$registry/$IMAGE_NAME:$VERSION"
+        revision_image="$registry/$IMAGE_NAME:sha-$REVISION"
+
+        docker tag "$SOURCE_IMAGE" "$version_image"
+        docker tag "$SOURCE_IMAGE" "$revision_image"
+        docker push "$version_image"
+        docker push "$revision_image"
+
+        echo "image=$version_image" >> "$GITHUB_OUTPUT"
+        {
+          printf '### Container image\n\n'
+          printf "Pushed \`%s\` and \`%s\`.\n" "$version_image" "$revision_image"
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # Docker Hub: stable versions only
+
+    - name: Log in to Docker Hub
+      if: ${{ inputs.push-docker-hub == 'true' && !contains(inputs.version, '-') }}
+      uses: DEFRA/cdp-build-action/docker-login@5e3632e25c7d4c3d514da45acaa149fd4c193640 # main
+      with:
+        iam-role-name: github-${{ inputs.image-name }}-build-role
+        aws-account-id: ${{ inputs.aws-account-id }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Push image to Docker Hub
+      if: ${{ inputs.push-docker-hub == 'true' && !contains(inputs.version, '-') }}
+      env:
+        SOURCE_IMAGE: ${{ steps.image.outputs.source }}
+        VERSION: ${{ inputs.version }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        IS_LATEST: ${{ steps.latest.outputs.is-latest }}
+      shell: bash
+      run: |
+        version_image="defradigital/$IMAGE_NAME:$VERSION"
+        docker tag "$SOURCE_IMAGE" "$version_image"
+        docker push "$version_image"
+        pushed=("$version_image")
+
+        if [[ "$IS_LATEST" == 'true' ]]; then
+          latest_image="defradigital/$IMAGE_NAME:latest"
+          docker tag "$SOURCE_IMAGE" "$latest_image"
+          docker push "$latest_image"
+          pushed+=("$latest_image")
+        fi
+
+        printf 'Pushed %s to Docker Hub.\n' "${pushed[*]}" | tee -a "$GITHUB_STEP_SUMMARY"

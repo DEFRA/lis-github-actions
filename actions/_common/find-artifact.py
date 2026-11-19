@@ -1,6 +1,11 @@
 """Finds the newest unexpired ARTIFACT_NAME artifact uploaded by a prerelease push or release pull
 request run for the checked-out commit, and writes its artifact-id and run-id to GITHUB_OUTPUT.
 
+A prerelease push run's head_sha is the commit it tagged. A release run is triggered by the pull request
+closing, so its head_sha is the pull request's head commit, while the stable tag is on the merge commit
+it built; for those runs, the head commit of the merged pull request that produced the tagged commit
+matches too.
+
 Reads GH_TOKEN, ARTIFACT_NAME and the standard GITHUB_* variables from the environment.
 """
 import json
@@ -16,10 +21,8 @@ REPOSITORY = os.environ['GITHUB_REPOSITORY']
 ARTIFACT_NAME = os.environ['ARTIFACT_NAME']
 
 # PR validation also uploads packages; only publish release builds.
-RELEASE_RUNS = {
-    ('.github/workflows/prerelease.yml', 'push'),
-    ('.github/workflows/release.yml', 'pull_request'),
-}
+PRERELEASE_RUN = ('.github/workflows/prerelease.yml', 'push')
+RELEASE_RUN = ('.github/workflows/release.yml', 'pull_request')
 
 
 def get(url):
@@ -44,12 +47,28 @@ def list_artifacts():
         yield from page['artifacts']
 
 
-def is_release_build(run, commit):
-    return (
-        run['head_sha'] == commit
-        and (run['status'] != 'completed' or run['conclusion'] == 'success')
-        and (run['path'], run['event']) in RELEASE_RUNS
-    )
+def merged_pull_request_heads(commit):
+    """Returns the head commits of the merged pull requests whose merge commit is commit."""
+    heads = set()
+    url = f'{API_URL}/repos/{REPOSITORY}/commits/{commit}/pulls?per_page=100'
+    while url:
+        page, url = get(url)
+        heads.update(
+            pull['head']['sha'] for pull in page
+            if pull.get('merged_at') and pull.get('merge_commit_sha') == commit
+        )
+    return heads
+
+
+def is_release_build(run, commit, release_heads):
+    if run['status'] == 'completed' and run['conclusion'] != 'success':
+        return False
+    kind = (run['path'], run['event'])
+    if kind == PRERELEASE_RUN:
+        return run['head_sha'] == commit
+    if kind == RELEASE_RUN:
+        return run['head_sha'] == commit or run['head_sha'] in release_heads()
+    return False
 
 
 def main():
@@ -60,10 +79,19 @@ def main():
         reverse=True,
     )
 
+    # Looked up once, and only when a release run is among the candidates.
+    cached_heads = []
+
+    def release_heads():
+        if not cached_heads:
+            cached_heads.append(merged_pull_request_heads(commit))
+            print(f'Merged pull request heads for {commit}: {sorted(cached_heads[0]) or "(none)"}')
+        return cached_heads[0]
+
     for artifact in candidates:
         run_id = artifact['workflow_run']['id']
         run, _ = get(f'{API_URL}/repos/{REPOSITORY}/actions/runs/{run_id}')
-        if not is_release_build(run, commit):
+        if not is_release_build(run, commit, release_heads):
             continue
 
         with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
