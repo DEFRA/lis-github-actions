@@ -161,16 +161,41 @@ runs:
       env:
         VERSION: ${{ inputs.version }}
         MIGRATIONS_PATH: ${{ steps.package.outputs.migrations-path }}
+        ARTIFACT_NAME: database-migrations-${{ inputs.version }}
+        BUILD_RUN_ID: ${{ steps.find-artifact.outputs.run-id }}
       shell: bash
       run: |
+        changes=''
         if [[ "$VERSION" != *-* ]]; then
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-        elif git diff --quiet origin/main...HEAD -- "$MIGRATIONS_PATH"; then
-          echo "changed=false" >> "$GITHUB_OUTPUT"
-          echo "No database migration changes from main to publish for \`$VERSION\`." | tee -a "$GITHUB_STEP_SUMMARY"
+          changed=true
+          decision="Publishing: \`$VERSION\` is a stable version, which is always published."
         else
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          # A failed comparison (for example no origin/main) stops the step instead of reading as a change.
+          changes=$(git diff --name-only origin/main...HEAD -- "$MIGRATIONS_PATH")
+          if [[ -z "$changes" ]]; then
+            changed=false
+            decision="Not publishing: \`$VERSION\` is a prerelease and \`$MIGRATIONS_PATH\` is unchanged from \`main\`."
+          else
+            changed=true
+            decision="Publishing: \`$VERSION\` is a prerelease that changes \`$MIGRATIONS_PATH\` compared with \`main\`."
+          fi
         fi
+        echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+        # A notice shows on the run page, so a skipped publish is not mistaken for a missing package.
+        echo "::notice title=Database migrations::${decision//\`/}"
+        {
+          printf '### Database migrations\n\n'
+          printf "Found and verified \`%s\` from [build run %s](%s/%s/actions/runs/%s).\n\n" \
+            "$ARTIFACT_NAME" "$BUILD_RUN_ID" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$BUILD_RUN_ID"
+          printf '%s\n' "$decision"
+          if [[ -n "$changes" ]]; then
+            printf "\nChanged from \`main\`:\n\n"
+            while IFS= read -r file; do
+              printf -- "- \`%s\`\n" "$file"
+            done <<< "$changes"
+          fi
+        } | tee -a "$GITHUB_STEP_SUMMARY"
 
     - name: Configure AWS credentials
       if: ${{ steps.changes.outputs.changed == 'true' }}
@@ -199,6 +224,5 @@ runs:
 
         echo "destination=$destination" >> "$GITHUB_OUTPUT"
         {
-          printf '### Database migrations\n\n'
-          printf "Published database schema migration version \`%s\` to \`%s\`.\n" "$VERSION" "$destination"
+          printf "\nPublished database schema migration version \`%s\` to \`%s\`.\n" "$VERSION" "$destination"
         } | tee -a "$GITHUB_STEP_SUMMARY"

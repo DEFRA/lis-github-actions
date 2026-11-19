@@ -228,7 +228,12 @@ runs:
           printf '### Database migrations\n\n```text\n'
           jq -r '"Version: \(.version)\nCommit: \(.commit)\nPath: \(.path)\nSHA-256: \(.sha256)\nFiles:\n" + (.files | map("  " + .) | join("\n"))' "$METADATA"
           printf 'Artifact: %s\n```\n\n' "$ARTIFACT"
-          printf '[Download workflow artifact](%s)\n' "$ARTIFACT_URL"
+          printf '[Download workflow artifact](%s)\n\n' "$ARTIFACT_URL"
+          # Packaged on every build with a changelog, changed or not: this build cannot compare with main.
+          printf 'The changelog was validated and applied to a throwaway PostgreSQL database, and is packaged on '
+          printf "every build that has one, whether or not it changed. \`actions/publish-liquibase\` always publishes "
+          printf "it for a stable version, and for a prerelease only when \`%s\` differs from \`main\`.\n" \
+            "$(jq -r '.path' "$METADATA")"
         } | tee -a "$GITHUB_STEP_SUMMARY"
 
     # NuGet packages
