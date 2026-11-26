@@ -82,7 +82,7 @@ jobs:
           cache: npm
 
       - name: Package tagged source
-        uses: cake-build/cake-action@ba3e4038094f93cd11603648f97d23d1ca7058b8 # master after v3.0.1: runs on node24 (unreleased)
+        uses: cake-build/cake-action@f76b70bb73991d6556ec0773b057e6c28772c41b # master after v3.0.1: runs on node24 (unreleased)
         env:
           PACKAGE_VERSION: ${{ needs.validate-release.outputs.version }}
           OUTPUT_DIR: artifacts
