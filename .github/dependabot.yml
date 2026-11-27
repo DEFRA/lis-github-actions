@@ -11,7 +11,7 @@ updates:
       time: '10:30'
       timezone: Europe/London
     commit-message:
-      prefix: 'LREG-XXX:'
+      prefix: 'BOT:'
     cooldown:
       default-days: 3
       # Our own workflows are released and consumed the same day.
